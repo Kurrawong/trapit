@@ -1,11 +1,12 @@
 [project]
 name = "trapit"
-version = "0.0.4"
+version = "0.0.5"
 description = "Tracked Reprocessable Async/Parallel Iterator - parallel processing with LMDB tracking"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "lmdb>=2.2.1",
+    "rich>=15.0.0",
 ]
 
 [dependency-groups]

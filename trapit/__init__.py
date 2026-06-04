@@ -1,12 +1,12 @@
 """
-TRAPIT - Tracked Async/Parallel Iterator
+TRAPIT - Tracked Async/Parallel Iterator with Rich Progress Bar
 
-A parallel processing utility that tracks processed items in LMDB to support
-resumable processing with configurable reprocessing modes.
+Extended to include a Rich progress bar with ETA, only displayed if running in a TTY.
 """
 
 import logging
 import pickle
+import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -15,6 +15,7 @@ from multiprocessing import Pool, cpu_count
 from typing import Callable, Hashable, Iterable, Optional, TypeVar, Union
 
 import lmdb
+from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -22,7 +23,6 @@ K = TypeVar("K", bound=Hashable)
 
 # Type alias for repro parameter: can be a string mode or a callable
 ReproType = Union[str, Callable[[T], bool]]
-
 
 # Status constants for worker results
 SKIPPED = "__SKIPPED__"
@@ -118,7 +118,7 @@ class TrackedParallelIterator:
     A parallel iterator that tracks processed items in LMDB.
 
     Supports multiprocessing and multithreading modes with configurable
-    reprocessing behavior.
+    reprocessing behavior and an optional Rich progress bar.
 
     Args:
         iterable: The input items to process
@@ -134,9 +134,8 @@ class TrackedParallelIterator:
             - 'errors': Only reprocess items that previously errored
             - 'all': Process all items, ignoring existing state
             - Callable[[T], bool]: A function that takes an item and returns True
-              if it should be processed. When using a callable, the LMDB tracker
-              is ignored for determining whether to process, but is still used
-              to mark items as processed or in error.
+              if it should be processed.
+        show_progress: Whether to show a Rich progress bar (default: True if TTY)
 
     Yields:
         tuple: (item, key, result) for each successfully processed item.
@@ -145,24 +144,6 @@ class TrackedParallelIterator:
         completed: Returns the number of successfully completed items.
         errors: Returns the number of items that resulted in errors.
         skipped: Returns the number of items that were skipped.
-
-    Example:
-        with TrackedParallelIterator(
-            items, process_item, get_key, "./tracker_db", mode="multithreading"
-        ) as pit:
-            for item, item_key, result in pit:
-                print(f"Processed {item_key}: {result}")
-            print(f"Completed: {pit.completed}, Errors: {pit.errors}, Skipped: {pit.skipped}")
-
-        # Using a custom callable for repro
-        def should_reprocess(item):
-            return item.get('priority') == 'high'
-
-        with TrackedParallelIterator(
-            items, process_item, get_key, "./tracker_db", repro=should_reprocess
-        ) as pit:
-            for item, item_key, result in pit:
-                print(f"Processed {item_key}: {result}")
     """
 
     def __init__(
@@ -176,6 +157,7 @@ class TrackedParallelIterator:
         chunksize: int = 1,
         map_size: int = 1024 * 1024 * 1024,
         repro: ReproType = "none",
+        show_progress: Optional[bool] = None,
     ):
         if workers is None:
             workers = max(1, cpu_count() - 1)
@@ -200,11 +182,39 @@ class TrackedParallelIterator:
         self._error_count = 0
         self._skipped_count = 0
 
+        # Determine if progress bar should be shown
+        self._show_progress = show_progress
+        if self._show_progress is None:
+            self._show_progress = sys.stdout.isatty()
+
+        # Try to determine total from iterable length
+        try:
+            self._total: Optional[int] = len(iterable)  # type: ignore[arg-type]
+        except TypeError:
+            self._total = None
+
+        self._progress = None
+
     def __enter__(self):
         # Reset counters when entering context
         self._completed_count = 0
         self._error_count = 0
         self._skipped_count = 0
+
+        # Initialize progress bar if enabled
+        if self._show_progress:
+            self._progress = Progress(
+                BarColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TextColumn("[progress.completed]{task.completed}/{task.total}"),
+                TimeRemainingColumn(),
+            )
+            self._progress.start()
+            self._task_id = self._progress.add_task(
+                "Processing",
+                total=self._total,
+                completed=0,
+            )
 
         if self.mode == "multiprocessing":
             self._pool = Pool(self.workers)
@@ -238,6 +248,9 @@ class TrackedParallelIterator:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._progress:
+            self._progress.stop()
+
         if self.mode == "multiprocessing" and self._pool:
             self._pool.close()
             self._pool.join()
@@ -261,11 +274,17 @@ class TrackedParallelIterator:
             status, item, key, data = result
             if status == COMPLETED:
                 self._completed_count += 1
+                if self._progress:
+                    self._progress.update(self._task_id, advance=1)
                 yield (item, key, data)
             elif status == SKIPPED:
                 self._skipped_count += 1
+                if self._progress:
+                    self._progress.update(self._task_id, advance=1)
             elif status == ERROR:
                 self._error_count += 1
+                if self._progress:
+                    self._progress.update(self._task_id, advance=1)
 
     @property
     def completed(self) -> int:

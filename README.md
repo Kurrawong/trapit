@@ -118,6 +118,31 @@ with TrackedParallelIterator(..., repro=should_reprocess) as pit:
 - **Status Cleanup**: When an item's status changes (error → success or vice versa), old markers are automatically cleaned up
 - **Processing Statistics**: Track completed, errored, and skipped item counts with `completed`, `errors`, and `skipped` properties
 - **3-tuple Yield**: Iteration now yields `(item, key, result)` for each successfully processed item
+- **Rich Progress Bar**: Built-in progress bar with ETA, displayed when running in a TTY
+
+## Progress Bar
+
+By default, a Rich progress bar is displayed when running in a terminal (TTY). You can control this behavior with the `show_progress` parameter:
+
+```python
+# Show progress bar (default when in TTY)
+with TrackedParallelIterator(..., show_progress=True) as pit:
+    ...
+
+# Hide progress bar
+with TrackedParallelIterator(..., show_progress=False) as pit:
+    ...
+
+# Auto-detect based on TTY (default behavior)
+with TrackedParallelIterator(...) as pit:
+    ...
+```
+
+The progress bar shows:
+- A visual progress bar
+- Task description
+- Completed/total count
+- Estimated time remaining
 
 ## Development
 
