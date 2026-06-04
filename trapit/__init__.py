@@ -15,7 +15,7 @@ from multiprocessing import Pool, cpu_count
 from typing import Callable, Hashable, Iterable, Optional, TypeVar, Union
 
 import lmdb
-from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn, Console
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -208,6 +208,8 @@ class TrackedParallelIterator:
                 TextColumn("[progress.description]{task.description}"),
                 TextColumn("[progress.completed]{task.completed}/{task.total}"),
                 TimeRemainingColumn(),
+                console=Console(),
+                expand=True
             )
             self._progress.start()
             self._task_id = self._progress.add_task(
@@ -250,7 +252,6 @@ class TrackedParallelIterator:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._progress:
             self._progress.stop()
-            print()
 
         if self.mode == "multiprocessing" and self._pool:
             self._pool.close()

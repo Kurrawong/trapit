@@ -1,6 +1,6 @@
 [project]
 name = "trapit"
-version = "0.0.6"
+version = "0.0.7"
 description = "Tracked Reprocessable Async/Parallel Iterator - parallel processing with LMDB tracking"
 readme = "README.md"
 requires-python = ">=3.12"
