@@ -5,6 +5,7 @@ A parallel processing utility that tracks processed items in LMDB to support
 resumable processing with configurable reprocessing modes.
 """
 
+import logging
 import pickle
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -104,6 +105,7 @@ def _worker_process_item(
             txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
             # Clear any existing success marker for this key
             txn.delete(key.encode())
+        logging.error(e)
         return (ERROR, item, key, e)
     finally:
         # Close if we opened it ourselves (multiprocessing mode)
