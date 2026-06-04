@@ -47,6 +47,27 @@ def process_item_with_retry(item: int, attempt_count: dict) -> int:
     return item * 2
 
 
+# Repro callable functions (defined at module level for pickling)
+def repro_only_even(item: int) -> bool:
+    """Callable that only processes even items."""
+    return item % 2 == 0
+
+
+def repro_process_all(item: int) -> bool:
+    """Callable that processes all items."""
+    return True
+
+
+def repro_only_gt_2(item: int) -> bool:
+    """Callable that only processes items > 2."""
+    return item > 2
+
+
+def repro_only_gt_3(item: int) -> bool:
+    """Callable that only processes items > 3."""
+    return item > 3
+
+
 def get_key(item: int) -> str:
     """Generate key for an item."""
     return f"item_{item}"
@@ -359,6 +380,135 @@ class TestMultiprocessingMode:
             error_data = txn.get(b"error:item_3")
         env.close()
         assert error_data is not None
+
+
+class TestReproCallable:
+    """Test callable repro function."""
+
+    def test_callable_repro_filters_items(self, db_path):
+        """Test that callable repro filters items correctly."""
+        items = [1, 2, 3, 4, 5, 6]
+
+        with TrackedParallelIterator(
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro=repro_only_even,
+        ) as pit:
+            results = list(pit)
+
+        # Only even items should be processed: 2, 4, 6
+        assert len(results) == 3
+        keys = [r[0] for r in results]
+        assert "item_2" in keys
+        assert "item_4" in keys
+        assert "item_6" in keys
+        assert "item_1" not in keys
+        assert "item_3" not in keys
+        assert "item_5" not in keys
+
+    def test_callable_repro_ignores_lmdb_tracker(self, db_path):
+        """Test that callable repro ignores existing LMDB state."""
+        items = [1, 2, 3, 4]
+
+        # First, process all items to mark them as done
+        with TrackedParallelIterator(
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro="all",
+        ) as pit:
+            list(pit)
+
+        # Now use a callable that says to process all
+        # Even though all items are marked as processed in LMDB,
+        # the callable should cause them to be reprocessed
+        with TrackedParallelIterator(
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro=repro_process_all,
+        ) as pit:
+            results = list(pit)
+
+        # All items should be processed again
+        assert len(results) == 4
+
+    def test_callable_repro_still_tracks_state(self, db_path):
+        """Test that LMDB tracking still works with callable repro."""
+        items = [1, 2, 3, 4]
+
+        with TrackedParallelIterator(
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro=repro_only_gt_2,
+        ) as pit:
+            list(pit)
+
+        # Check that processed items (3, 4) have success markers
+        env = lmdb.open(db_path, readonly=True)
+        with env.begin() as txn:
+            assert txn.get(b"item_3") is not None
+            assert txn.get(b"item_4") is not None
+            # Items 1, 2 should NOT have markers
+            assert txn.get(b"item_1") is None
+            assert txn.get(b"item_2") is None
+        env.close()
+
+    def test_callable_repro_error_tracking(self, db_path):
+        """Test that error tracking works with callable repro."""
+        items = [1, 2, 3, 4]
+
+        with TrackedParallelIterator(
+            items,
+            process_item_fail_on_3,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro=repro_process_all,
+        ) as pit:
+            list(pit)
+
+        # Check that item 3 has an error marker
+        env = lmdb.open(db_path, readonly=True)
+        with env.begin() as txn:
+            assert txn.get(b"error:item_3") is not None
+            # Other items should have success markers
+            assert txn.get(b"item_1") is not None
+            assert txn.get(b"item_2") is not None
+            assert txn.get(b"item_4") is not None
+        env.close()
+
+    def test_callable_repro_multiprocessing(self, db_path):
+        """Test that callable repro works with multiprocessing mode."""
+        items = [1, 2, 3, 4, 5, 6]
+
+        with TrackedParallelIterator(
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multiprocessing",
+            workers=2,
+            repro=repro_only_gt_3,
+        ) as pit:
+            results = list(pit)
+
+        # Only items 4, 5, 6 should be processed
+        assert len(results) == 3
+        keys = [r[0] for r in results]
+        assert "item_4" in keys
+        assert "item_5" in keys
+        assert "item_6" in keys
 
 
 class TestInvalidInputs:

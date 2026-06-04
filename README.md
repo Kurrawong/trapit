@@ -55,6 +55,7 @@ The `repro` parameter controls how items are reprocessed:
 - **`"none"`** (default): Skip items that were already processed (success or error)
 - **`"errors"`**: Only reprocess items that previously failed
 - **`"all"`**: Process all items, ignoring existing state
+- **`Callable[[T], bool]`**: A custom function that takes an item and returns `True` if it should be processed. When using a callable, the LMDB tracker is **ignored** for determining whether to process, but is still used to mark items as processed or in error after processing.
 
 ```python
 # Retry only failed items
@@ -64,6 +65,15 @@ with TrackedParallelIterator(..., repro="errors") as pit:
 
 # Reprocess everything from scratch
 with TrackedParallelIterator(..., repro="all") as pit:
+    for item_key, result in pit:
+        ...
+
+# Use a custom function to decide per-item
+def should_reprocess(item: dict) -> bool:
+    # Only reprocess high-priority items
+    return item.get("priority") == "high"
+
+with TrackedParallelIterator(..., repro=should_reprocess) as pit:
     for item_key, result in pit:
         ...
 ```

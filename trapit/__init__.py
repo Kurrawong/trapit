@@ -10,14 +10,17 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
-from multiprocessing import Pool
-from typing import Callable, Hashable, Iterable, Optional, TypeVar
+from multiprocessing import Pool, cpu_count
+from typing import Callable, Hashable, Iterable, Optional, TypeVar, Union
 
 import lmdb
 
 T = TypeVar("T")
 R = TypeVar("R")
 K = TypeVar("K", bound=Hashable)
+
+# Type alias for repro parameter: can be a string mode or a callable
+ReproType = Union[str, Callable[[T], bool]]
 
 
 def _worker_process_item(
@@ -27,7 +30,7 @@ def _worker_process_item(
     env: Optional[lmdb.Environment] = None,
     db_path: Optional[str] = None,
     map_size: Optional[int] = None,
-    repro: str = "none",
+    repro: ReproType = "none",
 ) -> Optional[tuple[str, R]]:
     # Determine which environment to use
     if env is None:
@@ -37,27 +40,40 @@ def _worker_process_item(
         env = lmdb.open(db_path, map_size=map_size, writemap=True, readonly=False)
 
     key = key_func(item)
+
+    # Check if repro is a callable - if so, use it to determine processing
+    # The LMDB tracker is ignored for the decision, but still used for marking
+    if callable(repro):
+        should_process = repro(item)
+        if not should_process:
+            return None
+    else:
+        # repro is a string mode
+        try:
+            with env.begin() as txn:
+                has_success = txn.get(key.encode()) is not None
+                has_error = txn.get(f"error:{key}".encode()) is not None
+
+                if repro == "none":
+                    # Skip if already processed (success or error)
+                    if has_success or has_error:
+                        return None
+                elif repro == "errors":
+                    # Only process items that have errors but no success (retry failures)
+                    if not has_error or has_success:
+                        return None
+                elif repro == "all":
+                    # Process everything, ignore existing state
+                    pass
+                else:
+                    raise ValueError(
+                        f"repro must be 'none', 'errors', 'all', or a callable, got '{repro}'"
+                    )
+        except Exception:
+            # If we can't read from the database, proceed with processing
+            pass
+
     try:
-        with env.begin() as txn:
-            has_success = txn.get(key.encode()) is not None
-            has_error = txn.get(f"error:{key}".encode()) is not None
-
-            if repro == "none":
-                # Skip if already processed (success or error)
-                if has_success or has_error:
-                    return None
-            elif repro == "errors":
-                # Only process items that have errors but no success (retry failures)
-                if not has_error or has_success:
-                    return None
-            elif repro == "all":
-                # Process everything, ignore existing state
-                pass
-            else:
-                raise ValueError(
-                    f"repro must be 'none', 'errors', or 'all', got '{repro}'"
-                )
-
         result = func(item)
         with env.begin(write=True) as txn:
             txn.put(key.encode(), b"1")
@@ -95,17 +111,31 @@ class TrackedParallelIterator:
         key_func: Function to generate a unique string key for each item
         db_path: Path to the LMDB database directory
         mode: 'multiprocessing' or 'multithreading'
-        workers: Number of parallel workers
+        workers: Number of parallel workers. Defaults to cpu_count - 1
         chunksize: For multiprocessing, number of items per chunk
         map_size: LMDB map size in bytes
-        repro: Reprocessing mode - 'none', 'errors', or 'all'
+        repro: Reprocessing mode - 'none', 'errors', 'all', or a callable
             - 'none': Skip items already processed (success or error)
             - 'errors': Only reprocess items that previously errored
             - 'all': Process all items, ignoring existing state
+            - Callable[[T], bool]: A function that takes an item and returns True
+              if it should be processed. When using a callable, the LMDB tracker
+              is ignored for determining whether to process, but is still used
+              to mark items as processed or in error.
 
     Example:
         with TrackedParallelIterator(
             items, process_item, get_key, "./tracker_db", mode="multithreading"
+        ) as pit:
+            for item_key, result in pit:
+                print(f"Processed {item_key}: {result}")
+
+        # Using a custom callable for repro
+        def should_reprocess(item):
+            return item.get('priority') == 'high'
+
+        with TrackedParallelIterator(
+            items, process_item, get_key, "./tracker_db", repro=should_reprocess
         ) as pit:
             for item_key, result in pit:
                 print(f"Processed {item_key}: {result}")
@@ -118,13 +148,17 @@ class TrackedParallelIterator:
         key_func: Callable[[T], str],
         db_path: str,
         mode: str = "multiprocessing",
-        workers: int = 4,
+        workers: Optional[int] = None,
         chunksize: int = 1,
         map_size: int = 1024 * 1024 * 1024,
-        repro: str = "none",
+        repro: ReproType = "none",
     ):
-        if repro not in ("none", "errors", "all"):
-            raise ValueError(f"repro must be 'none', 'errors', or 'all', got '{repro}'")
+        if workers is None:
+            workers = max(1, cpu_count() - 1)
+        if not callable(repro) and repro not in ("none", "errors", "all"):
+            raise ValueError(
+                f"repro must be 'none', 'errors', 'all', or a callable, got '{repro}'"
+            )
         self.iterable = iterable
         self.func = func
         self.key_func = key_func
