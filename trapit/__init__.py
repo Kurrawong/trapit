@@ -250,6 +250,7 @@ class TrackedParallelIterator:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._progress:
             self._progress.stop()
+            print()
 
         if self.mode == "multiprocessing" and self._pool:
             self._pool.close()
