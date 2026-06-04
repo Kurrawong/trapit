@@ -1,10 +1,24 @@
 [project]
-name = "temp"
+name = "trapit"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tracked Reprocessable Async/Parallel Iterator - parallel processing with LMDB tracking"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "lmdb>=2.2.1",
-    "mypy>=2.1.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "mypy>=2.1.0",
+    "black>=26.5.1",
+    "isort>=8.0.1",
+    "ruff>=0.15.15",
+]
+
+[tool.isort]
+profile = "black"
+
+[tool.black]
+target-version = ["py312"]

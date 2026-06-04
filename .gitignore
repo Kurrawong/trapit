@@ -8,3 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Test and cache directories
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# LMDB database
+*.lmdb
+lmdb_*
+test_lmdb_*
+
+# UV lock file (optional - can be regenerated)
+# uv.lock

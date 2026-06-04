@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+# https://taskfile.dev/docs/guide
+#
+version: '3'
+
+tasks:
+  default:
+    desc: list all tasks
+    cmd: task --list
+
+  install:
+    desc: Install deps
+    cmd: uv sync
+
+  test:
+    desc: Run the test suite
+    cmd: uv run pytest
+
+  format:
+    desc: Format the codebase
+    cmds:
+      - uv run black .
+      - uv run isort .
+
+  lint:
+    desc: Lint the codebase
+    cmds:
+      - uv run ruff check --fix .
+      - uv run mypy .
+
+  code:
+    - task: test
+    - task: format
+    - task: lint

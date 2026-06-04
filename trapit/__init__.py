@@ -1,4 +1,10 @@
-import os
+"""
+TRAPIT - Tracked Async/Parallel Iterator
+
+A parallel processing utility that tracks processed items in LMDB to support
+resumable processing with configurable reprocessing modes.
+"""
+
 import pickle
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -48,7 +54,9 @@ def _worker_process_item(
                 # Process everything, ignore existing state
                 pass
             else:
-                raise ValueError(f"repro must be 'none', 'errors', or 'all', got '{repro}'")
+                raise ValueError(
+                    f"repro must be 'none', 'errors', or 'all', got '{repro}'"
+                )
 
         result = func(item)
         with env.begin(write=True) as txn:
@@ -75,6 +83,34 @@ def _worker_process_item(
 
 
 class TrackedParallelIterator:
+    """
+    A parallel iterator that tracks processed items in LMDB.
+
+    Supports multiprocessing and multithreading modes with configurable
+    reprocessing behavior.
+
+    Args:
+        iterable: The input items to process
+        func: Function to apply to each item
+        key_func: Function to generate a unique string key for each item
+        db_path: Path to the LMDB database directory
+        mode: 'multiprocessing' or 'multithreading'
+        workers: Number of parallel workers
+        chunksize: For multiprocessing, number of items per chunk
+        map_size: LMDB map size in bytes
+        repro: Reprocessing mode - 'none', 'errors', or 'all'
+            - 'none': Skip items already processed (success or error)
+            - 'errors': Only reprocess items that previously errored
+            - 'all': Process all items, ignoring existing state
+
+    Example:
+        with TrackedParallelIterator(
+            items, process_item, get_key, "./tracker_db", mode="multithreading"
+        ) as pit:
+            for item_key, result in pit:
+                print(f"Processed {item_key}: {result}")
+    """
+
     def __init__(
         self,
         iterable: Iterable[T],
@@ -148,7 +184,16 @@ class TrackedParallelIterator:
         return (result for result in self._iterator if result is not None)
 
     def log_error(self, key: str, error: Exception) -> None:
-        """Log an error to the LMDB database with the given key."""
+        """
+        Log an error to the LMDB database with the given key.
+
+        This is useful for logging errors that occur outside the worker
+        (e.g., during post-processing).
+
+        Args:
+            key: The item key (without 'error:' prefix)
+            error: The exception that occurred
+        """
         error_data = {
             "timestamp": datetime.now().isoformat(),
             "error_type": type(error).__name__,
@@ -160,6 +205,8 @@ class TrackedParallelIterator:
         if self._env is not None:
             with self._env.begin(write=True) as txn:
                 txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
+                # Clear any existing success marker
+                txn.delete(key.encode())
         else:
             # Open a new environment for multiprocessing mode or external usage
             env = lmdb.open(
@@ -168,86 +215,7 @@ class TrackedParallelIterator:
             try:
                 with env.begin(write=True) as txn:
                     txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
+                    # Clear any existing success marker
+                    txn.delete(key.encode())
             finally:
                 env.close()
-
-
-# Example Usage
-def process_item(item: int) -> int:
-    if item == 3:
-        raise ValueError(f"Simulated error for item {item}")
-    return item * 2
-
-
-def get_key(item: int) -> str:
-    return f"item_{item}"
-
-
-def post_process(result: int) -> None:
-    if result == 8:
-        raise RuntimeError("Simulated post-processing error for result 8")
-    print(f"Processed result: {result}")
-
-
-def print_tracked_items(db_path: str, map_size: int = 1024 * 1024 * 1024):
-    print("\nTracked items:")
-    env = lmdb.open(db_path, readonly=True, map_size=map_size)
-    with env.begin() as txn:
-        cursor = txn.cursor()
-        for key, _ in cursor:
-            if not key.startswith(b"error:"):
-                print(key.decode())
-    env.close()
-
-
-def print_errors(db_path: str, map_size: int = 1024 * 1024 * 1024):
-    print("\nErrors:")
-    env = lmdb.open(db_path, readonly=True, map_size=map_size)
-    with env.begin() as txn:
-        cursor = txn.cursor()
-        for key, value in cursor:
-            if key.startswith(b"error:"):
-                error_data = pickle.loads(value)
-                print(
-                    f"{key.decode()}: {error_data['error_type']} - {error_data['error_message']}"
-                )
-    env.close()
-
-
-if __name__ == "__main__":
-    db_path = "./lmdb_tracker"
-    if os.path.exists(db_path):
-        import shutil
-
-        shutil.rmtree(db_path)
-    os.makedirs(db_path, exist_ok=True)
-
-    items = [1, 2, 3, 4, 5, 3, 4]
-
-    # Test multiprocessing
-    print("=== Multiprocessing ===")
-    with TrackedParallelIterator(
-        items, process_item, get_key, db_path, mode="multiprocessing", workers=2
-    ) as pit:
-        for item_key, result in pit:
-            try:
-                post_process(result)
-            except Exception as e:
-                pit.log_error(item_key, e)
-
-    print_tracked_items(db_path)
-    print_errors(db_path)
-
-    # Test multithreading
-    print("\n=== Multithreading ===")
-    with TrackedParallelIterator(
-        items, process_item, get_key, db_path, mode="multithreading", workers=2
-    ) as pit:
-        for item_key, result in pit:
-            try:
-                post_process(result)
-            except Exception as e:
-                pit.log_error(item_key, e)
-
-    print_tracked_items(db_path)
-    print_errors(db_path)
