@@ -104,10 +104,10 @@ class TestBasicProcessing:
         assert len(processed) == 5
         assert processed[0] == (1, "item_1", 2)
         assert processed[1] == (2, "item_2", 4)
-        # Test the count methods
-        assert pit.completed() == 5
-        assert pit.errors() == 0
-        assert pit.skipped() == 0
+        # Test the count properties
+        assert pit.completed == 5
+        assert pit.errors == 0
+        assert pit.skipped == 0
 
     def test_skip_already_processed(self, db_path):
         """Test that already processed items are skipped with repro='none'."""
@@ -132,9 +132,9 @@ class TestBasicProcessing:
             results = list(pit)
             # All items should be skipped
             assert len(results) == 0
-            assert pit.completed() == 0
-            assert pit.skipped() == 5
-            assert pit.errors() == 0
+            assert pit.completed == 0
+            assert pit.skipped == 5
+            assert pit.errors == 0
 
 
 class TestErrorHandling:
@@ -151,10 +151,10 @@ class TestErrorHandling:
 
         # Item 3 should have failed, so only 4 items should have results
         assert len(results) == 4
-        # Check the count methods
-        assert pit.completed() == 4
-        assert pit.errors() == 1
-        assert pit.skipped() == 0
+        # Check the count properties
+        assert pit.completed == 4
+        assert pit.errors == 1
+        assert pit.skipped == 0
 
         # Check error is in database
         env = lmdb.open(db_path, readonly=True)
@@ -217,9 +217,9 @@ class TestReproModes:
         ) as pit:
             results = list(pit)
             assert len(results) == 5
-            assert pit.completed() == 5
-            assert pit.errors() == 0
-            assert pit.skipped() == 0
+            assert pit.completed == 5
+            assert pit.errors == 0
+            assert pit.skipped == 0
 
     def test_repro_errors(self, db_path):
         """Test repro='errors' only retries items that had errors."""
@@ -255,9 +255,9 @@ class TestReproModes:
         assert results[0][1] == "item_3"  # Now it's (item, key, result)
         assert results[0][0] == 3  # item
         assert results[0][2] == 6  # result
-        assert pit.completed() == 1
-        assert pit.skipped() == 4  # Items 1, 2, 4, 5 were skipped
-        assert pit.errors() == 0
+        assert pit.completed == 1
+        assert pit.skipped == 4  # Items 1, 2, 4, 5 were skipped
+        assert pit.errors == 0
 
     def test_repro_none_default(self, db_path):
         """Test repro='none' is the default."""
@@ -274,9 +274,9 @@ class TestReproModes:
             results = list(pit)
             # All items should be skipped in second run
             assert len(results) == 0
-            assert pit.completed() == 0
-            assert pit.skipped() == 3
-            assert pit.errors() == 0
+            assert pit.completed == 0
+            assert pit.skipped == 3
+            assert pit.errors == 0
 
 
 class TestStatusCleanup:
@@ -393,9 +393,9 @@ class TestMultiprocessingMode:
                 processed.append((item, item_key, result))
 
         assert len(processed) == 5
-        assert pit.completed() == 5
-        assert pit.errors() == 0
-        assert pit.skipped() == 0
+        assert pit.completed == 5
+        assert pit.errors == 0
+        assert pit.skipped == 0
 
     def test_multiprocessing_error_tracking(self, db_path):
         """Test error tracking in multiprocessing mode."""
@@ -413,9 +413,9 @@ class TestMultiprocessingMode:
 
         # Item 3 should have failed
         assert len(results) == 4
-        assert pit.completed() == 4
-        assert pit.errors() == 1
-        assert pit.skipped() == 0
+        assert pit.completed == 4
+        assert pit.errors == 1
+        assert pit.skipped == 0
 
         # Check error is in database
         env = lmdb.open(db_path, readonly=True)
@@ -452,9 +452,9 @@ class TestReproCallable:
         assert "item_3" not in keys
         assert "item_5" not in keys
         # 3 items completed, 3 items skipped (1, 3, 5)
-        assert pit.completed() == 3
-        assert pit.skipped() == 3
-        assert pit.errors() == 0
+        assert pit.completed == 3
+        assert pit.skipped == 3
+        assert pit.errors == 0
 
     def test_callable_repro_ignores_lmdb_tracker(self, db_path):
         """Test that callable repro ignores existing LMDB state."""
@@ -486,9 +486,9 @@ class TestReproCallable:
 
         # All items should be processed again
         assert len(results) == 4
-        assert pit.completed() == 4
-        assert pit.errors() == 0
-        assert pit.skipped() == 0
+        assert pit.completed == 4
+        assert pit.errors == 0
+        assert pit.skipped == 0
 
     def test_callable_repro_still_tracks_state(self, db_path):
         """Test that LMDB tracking still works with callable repro."""
@@ -514,9 +514,9 @@ class TestReproCallable:
             assert txn.get(b"item_2") is None
         env.close()
         # Check counters
-        assert pit.completed() == 2
-        assert pit.skipped() == 2
-        assert pit.errors() == 0
+        assert pit.completed == 2
+        assert pit.skipped == 2
+        assert pit.errors == 0
 
     def test_callable_repro_error_tracking(self, db_path):
         """Test that error tracking works with callable repro."""
@@ -542,9 +542,9 @@ class TestReproCallable:
             assert txn.get(b"item_4") is not None
         env.close()
         # Check counters
-        assert pit.completed() == 3
-        assert pit.errors() == 1
-        assert pit.skipped() == 0
+        assert pit.completed == 3
+        assert pit.errors == 1
+        assert pit.skipped == 0
 
     def test_callable_repro_multiprocessing(self, db_path):
         """Test that callable repro works with multiprocessing mode."""
@@ -567,9 +567,9 @@ class TestReproCallable:
         assert "item_4" in keys
         assert "item_5" in keys
         assert "item_6" in keys
-        assert pit.completed() == 3
-        assert pit.skipped() == 3
-        assert pit.errors() == 0
+        assert pit.completed == 3
+        assert pit.skipped == 3
+        assert pit.errors == 0
 
 
 class TestProcessingCounts:
@@ -585,9 +585,9 @@ class TestProcessingCounts:
             results = list(pit)
 
         assert len(results) == 5
-        assert pit.completed() == 5
-        assert pit.errors() == 0
-        assert pit.skipped() == 0
+        assert pit.completed == 5
+        assert pit.errors == 0
+        assert pit.skipped == 0
 
     def test_mixed_completed_and_errors(self, db_path):
         """Test counting with a mix of completed and errored items."""
@@ -599,9 +599,9 @@ class TestProcessingCounts:
             results = list(pit)
 
         assert len(results) == 3  # items 1, 3, 5
-        assert pit.completed() == 3
-        assert pit.errors() == 2  # items 2, 4
-        assert pit.skipped() == 0
+        assert pit.completed == 3
+        assert pit.errors == 2  # items 2, 4
+        assert pit.skipped == 0
 
     def test_all_skipped(self, db_path):
         """Test counting when all items are skipped."""
@@ -625,9 +625,9 @@ class TestProcessingCounts:
             results = list(pit)
 
         assert len(results) == 0
-        assert pit.completed() == 0
-        assert pit.errors() == 0
-        assert pit.skipped() == 3
+        assert pit.completed == 0
+        assert pit.errors == 0
+        assert pit.skipped == 3
 
     def test_mixed_all_states(self, db_path):
         """Test counting with completed, errored, and skipped items."""
@@ -665,9 +665,9 @@ class TestProcessingCounts:
         # Only item 3 should be processed (it had an error)
         assert len(results) == 1
         assert results[0][0] == 3  # item
-        assert pit.completed() == 1
-        assert pit.skipped() == 5  # items 1, 2, 4, 5, 6
-        assert pit.errors() == 0
+        assert pit.completed == 1
+        assert pit.skipped == 5  # items 1, 2, 4, 5, 6
+        assert pit.errors == 0
 
     def test_counters_reset_between_runs(self, db_path):
         """Test that counters are reset when entering a new context."""
@@ -677,7 +677,7 @@ class TestProcessingCounts:
             items, process_item_success, get_key, db_path, mode="multithreading"
         ) as pit:
             list(pit)
-            first_completed = pit.completed()
+            first_completed = pit.completed
 
         # Counters should be reset in new context
         with TrackedParallelIterator(
@@ -689,7 +689,7 @@ class TestProcessingCounts:
             repro="all",
         ) as pit:
             list(pit)
-            second_completed = pit.completed()
+            second_completed = pit.completed
 
         assert first_completed == 3
         assert second_completed == 3
@@ -709,9 +709,9 @@ class TestProcessingCounts:
             results = list(pit)
 
         assert len(results) == 4
-        assert pit.completed() == 4
-        assert pit.errors() == 1
-        assert pit.skipped() == 0
+        assert pit.completed == 4
+        assert pit.errors == 1
+        assert pit.skipped == 0
 
 
 class TestInvalidInputs:

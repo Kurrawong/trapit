@@ -142,9 +142,9 @@ class TrackedParallelIterator:
         tuple: (item, key, result) for each successfully processed item.
 
     Attributes:
-        completed(): Returns the number of successfully completed items.
-        errors(): Returns the number of items that resulted in errors.
-        skipped(): Returns the number of items that were skipped.
+        completed: Returns the number of successfully completed items.
+        errors: Returns the number of items that resulted in errors.
+        skipped: Returns the number of items that were skipped.
 
     Example:
         with TrackedParallelIterator(
@@ -152,7 +152,7 @@ class TrackedParallelIterator:
         ) as pit:
             for item, item_key, result in pit:
                 print(f"Processed {item_key}: {result}")
-            print(f"Completed: {pit.completed()}, Errors: {pit.errors()}, Skipped: {pit.skipped()}")
+            print(f"Completed: {pit.completed}, Errors: {pit.errors}, Skipped: {pit.skipped}")
 
         # Using a custom callable for repro
         def should_reprocess(item):
@@ -267,6 +267,7 @@ class TrackedParallelIterator:
             elif status == ERROR:
                 self._error_count += 1
 
+    @property
     def completed(self) -> int:
         """
         Return the number of items that have been successfully completed.
@@ -276,6 +277,7 @@ class TrackedParallelIterator:
         """
         return self._completed_count
 
+    @property
     def errors(self) -> int:
         """
         Return the number of items that resulted in errors.
@@ -285,6 +287,7 @@ class TrackedParallelIterator:
         """
         return self._error_count
 
+    @property
     def skipped(self) -> int:
         """
         Return the number of items that were skipped.
