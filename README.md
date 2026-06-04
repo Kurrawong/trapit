@@ -52,8 +52,13 @@ with TrackedParallelIterator(
     mode="multithreading",
     workers=4,
 ) as pit:
-    for item_key, result in pit:
+    for item, item_key, result in pit:
         print(f"Processed {item_key}: {result}")
+    
+    # Get processing statistics
+    print(f"Completed: {pit.completed()}")  # Number of successfully processed items
+    print(f"Errors: {pit.errors()}")        # Number of items that failed
+    print(f"Skipped: {pit.skipped()}")      # Number of items that were skipped
 
 # Log errors that occur outside the worker
 try:
@@ -99,6 +104,8 @@ with TrackedParallelIterator(..., repro=should_reprocess) as pit:
 - **Error Tracking**: Errors are logged with timestamps, error types, messages, and tracebacks
 - **Resumable**: Can resume processing from where it left off
 - **Status Cleanup**: When an item's status changes (error → success or vice versa), old markers are automatically cleaned up
+- **Processing Statistics**: Track completed, errored, and skipped item counts with `completed()`, `errors()`, and `skipped()` methods
+- **3-tuple Yield**: Iteration now yields `(item, key, result)` for each successfully processed item
 
 ## Development
 

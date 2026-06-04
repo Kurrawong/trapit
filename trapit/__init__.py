@@ -23,6 +23,12 @@ K = TypeVar("K", bound=Hashable)
 ReproType = Union[str, Callable[[T], bool]]
 
 
+# Status constants for worker results
+SKIPPED = "__SKIPPED__"
+ERROR = "__ERROR__"
+COMPLETED = "__COMPLETED__"
+
+
 def _worker_process_item(
     item: T,
     func: Callable[[T], R],
@@ -31,7 +37,14 @@ def _worker_process_item(
     db_path: Optional[str] = None,
     map_size: Optional[int] = None,
     repro: ReproType = "none",
-) -> Optional[tuple[str, R]]:
+) -> tuple[str, T, str, Optional[R]]:
+    """
+    Process an item and return a tuple with status information.
+    
+    Returns:
+        (status, item, key, result_or_error)
+        where status is one of: COMPLETED, SKIPPED, ERROR
+    """
     # Determine which environment to use
     if env is None:
         # Multiprocessing: each process opens its own
@@ -46,7 +59,7 @@ def _worker_process_item(
     if callable(repro):
         should_process = repro(item)
         if not should_process:
-            return None
+            return (SKIPPED, item, key, None)
     else:
         # repro is a string mode
         try:
@@ -57,11 +70,11 @@ def _worker_process_item(
                 if repro == "none":
                     # Skip if already processed (success or error)
                     if has_success or has_error:
-                        return None
+                        return (SKIPPED, item, key, None)
                 elif repro == "errors":
                     # Only process items that have errors but no success (retry failures)
                     if not has_error or has_success:
-                        return None
+                        return (SKIPPED, item, key, None)
                 elif repro == "all":
                     # Process everything, ignore existing state
                     pass
@@ -79,7 +92,7 @@ def _worker_process_item(
             txn.put(key.encode(), b"1")
             # Clear any existing error marker for this key
             txn.delete(f"error:{key}".encode())
-        return (key, result)
+        return (COMPLETED, item, key, result)
     except Exception as e:
         error_data = {
             "timestamp": datetime.now().isoformat(),
@@ -91,7 +104,7 @@ def _worker_process_item(
             txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
             # Clear any existing success marker for this key
             txn.delete(key.encode())
-        return None
+        return (ERROR, item, key, e)
     finally:
         # Close if we opened it ourselves (multiprocessing mode)
         if env is not None and db_path is not None:
@@ -123,12 +136,21 @@ class TrackedParallelIterator:
               is ignored for determining whether to process, but is still used
               to mark items as processed or in error.
 
+    Yields:
+        tuple: (item, key, result) for each successfully processed item.
+
+    Attributes:
+        completed(): Returns the number of successfully completed items.
+        errors(): Returns the number of items that resulted in errors.
+        skipped(): Returns the number of items that were skipped.
+
     Example:
         with TrackedParallelIterator(
             items, process_item, get_key, "./tracker_db", mode="multithreading"
         ) as pit:
-            for item_key, result in pit:
+            for item, item_key, result in pit:
                 print(f"Processed {item_key}: {result}")
+            print(f"Completed: {pit.completed()}, Errors: {pit.errors()}, Skipped: {pit.skipped()}")
 
         # Using a custom callable for repro
         def should_reprocess(item):
@@ -137,7 +159,7 @@ class TrackedParallelIterator:
         with TrackedParallelIterator(
             items, process_item, get_key, "./tracker_db", repro=should_reprocess
         ) as pit:
-            for item_key, result in pit:
+            for item, item_key, result in pit:
                 print(f"Processed {item_key}: {result}")
     """
 
@@ -171,8 +193,17 @@ class TrackedParallelIterator:
         self._pool = None
         self._executor = None
         self._env = None  # Shared environment for multithreading
+        # Counters for tracking progress
+        self._completed_count = 0
+        self._error_count = 0
+        self._skipped_count = 0
 
     def __enter__(self):
+        # Reset counters when entering context
+        self._completed_count = 0
+        self._error_count = 0
+        self._skipped_count = 0
+        
         if self.mode == "multiprocessing":
             self._pool = Pool(self.workers)
             worker = partial(
@@ -215,7 +246,51 @@ class TrackedParallelIterator:
                 self._env = None
 
     def __iter__(self):
-        return (result for result in self._iterator if result is not None)
+        """
+        Iterate over processed items.
+        
+        Yields:
+            tuple: (item, key, result) for each successfully processed item.
+            Skipped and errored items are not yielded but are counted.
+        """
+        for result in self._iterator:
+            if result is None:
+                continue
+            status, item, key, data = result
+            if status == COMPLETED:
+                self._completed_count += 1
+                yield (item, key, data)
+            elif status == SKIPPED:
+                self._skipped_count += 1
+            elif status == ERROR:
+                self._error_count += 1
+
+    def completed(self) -> int:
+        """
+        Return the number of items that have been successfully completed.
+        
+        Returns:
+            int: Count of completed items
+        """
+        return self._completed_count
+
+    def errors(self) -> int:
+        """
+        Return the number of items that resulted in errors.
+        
+        Returns:
+            int: Count of errored items
+        """
+        return self._error_count
+
+    def skipped(self) -> int:
+        """
+        Return the number of items that were skipped.
+        
+        Returns:
+            int: Count of skipped items
+        """
+        return self._skipped_count
 
     def log_error(self, key: str, error: Exception) -> None:
         """
