@@ -4,7 +4,7 @@ Tracked Reprocessable Async/Parallel Iterator - parallel processing with LMDB tr
 
 ## Installation
 
-From GitHub:
+From GitHub (latest):
 
 ```bash
 uv pip install git+https://github.com/kurrawong/trapit.git
@@ -14,6 +14,18 @@ Or with pip:
 
 ```bash
 pip install git+https://github.com/kurrawong/trapit.git
+```
+
+From GitHub (specific version/tag):
+
+```bash
+uv pip install git+https://github.com/kurrawong/trapit.git@v0.0.1
+```
+
+Or with pip:
+
+```bash
+pip install git+https://github.com/kurrawong/trapit.git@v0.0.1
 ```
 
 Or locally:
