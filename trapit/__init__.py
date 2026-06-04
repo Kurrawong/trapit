@@ -37,10 +37,10 @@ def _worker_process_item(
     db_path: Optional[str] = None,
     map_size: Optional[int] = None,
     repro: ReproType = "none",
-) -> tuple[str, T, str, Optional[R]]:
+) -> tuple[str, T, str, R | None | Exception]:
     """
     Process an item and return a tuple with status information.
-    
+
     Returns:
         (status, item, key, result_or_error)
         where status is one of: COMPLETED, SKIPPED, ERROR
@@ -203,7 +203,7 @@ class TrackedParallelIterator:
         self._completed_count = 0
         self._error_count = 0
         self._skipped_count = 0
-        
+
         if self.mode == "multiprocessing":
             self._pool = Pool(self.workers)
             worker = partial(
@@ -248,7 +248,7 @@ class TrackedParallelIterator:
     def __iter__(self):
         """
         Iterate over processed items.
-        
+
         Yields:
             tuple: (item, key, result) for each successfully processed item.
             Skipped and errored items are not yielded but are counted.
@@ -268,7 +268,7 @@ class TrackedParallelIterator:
     def completed(self) -> int:
         """
         Return the number of items that have been successfully completed.
-        
+
         Returns:
             int: Count of completed items
         """
@@ -277,7 +277,7 @@ class TrackedParallelIterator:
     def errors(self) -> int:
         """
         Return the number of items that resulted in errors.
-        
+
         Returns:
             int: Count of errored items
         """
@@ -286,7 +286,7 @@ class TrackedParallelIterator:
     def skipped(self) -> int:
         """
         Return the number of items that were skipped.
-        
+
         Returns:
             int: Count of skipped items
         """
