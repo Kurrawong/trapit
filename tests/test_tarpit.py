@@ -615,7 +615,12 @@ class TestProcessingCounts:
 
         # Second run with repro='none' skips all
         with TrackedParallelIterator(
-            items, process_item_success, get_key, db_path, mode="multithreading", repro="none"
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro="none",
         ) as pit:
             results = list(pit)
 
@@ -676,7 +681,12 @@ class TestProcessingCounts:
 
         # Counters should be reset in new context
         with TrackedParallelIterator(
-            items, process_item_success, get_key, db_path, mode="multithreading", repro="all"
+            items,
+            process_item_success,
+            get_key,
+            db_path,
+            mode="multithreading",
+            repro="all",
         ) as pit:
             list(pit)
             second_completed = pit.completed()
