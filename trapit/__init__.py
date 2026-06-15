@@ -15,7 +15,7 @@ from multiprocessing import Pool, cpu_count
 from typing import Callable, Hashable, Iterable, Optional, TypeVar, Union
 
 import lmdb
-from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn, Console
+from rich.progress import BarColumn, Console, Progress, TextColumn, TimeRemainingColumn
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -209,7 +209,7 @@ class TrackedParallelIterator:
                 TextColumn("[progress.completed]{task.completed}/{task.total}"),
                 TimeRemainingColumn(),
                 console=Console(),
-                expand=True
+                expand=True,
             )
             self._progress.start()
             self._task_id = self._progress.add_task(
