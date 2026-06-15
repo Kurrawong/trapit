@@ -87,6 +87,16 @@ def get_key(item: int) -> str:
     return f"item_{item}"
 
 
+def process_with_args(item: int, multiplier: int = 2) -> int:
+    """Processing function that accepts additional arguments."""
+    return item * multiplier
+
+
+def process_with_args_and_kwargs(item: int, multiplier: int, offset: int = 0) -> int:
+    """Processing function that accepts both args and kwargs."""
+    return (item * multiplier) + offset
+
+
 class TestBasicProcessing:
     """Test basic processing functionality."""
 
@@ -712,6 +722,157 @@ class TestProcessingCounts:
         assert pit.completed == 4
         assert pit.errors == 1
         assert pit.skipped == 0
+
+
+class TestFuncArgsKwargs:
+    """Test func_args and func_kwargs parameters."""
+
+    def test_func_args_multithreading(self, db_path):
+        """Test that func_args works with multithreading mode."""
+        items = [1, 2, 3, 4, 5]
+        multiplier = 3
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args,
+            get_key,
+            db_path,
+            mode="multithreading",
+            func_args=(multiplier,),
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 5
+        assert results[0][2] == 1 * multiplier  # result
+        assert results[1][2] == 2 * multiplier
+        assert pit.completed == 5
+        assert pit.errors == 0
+
+    def test_func_kwargs_multithreading(self, db_path):
+        """Test that func_kwargs works with multithreading mode."""
+        items = [1, 2, 3, 4, 5]
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args,
+            get_key,
+            db_path,
+            mode="multithreading",
+            func_kwargs={"multiplier": 4},
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 5
+        assert results[0][2] == 1 * 4
+        assert results[1][2] == 2 * 4
+        assert pit.completed == 5
+
+    def test_func_args_and_kwargs_multithreading(self, db_path):
+        """Test that func_args and func_kwargs work together with multithreading."""
+        items = [1, 2, 3]
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args_and_kwargs,
+            get_key,
+            db_path,
+            mode="multithreading",
+            func_args=(2,),  # multiplier
+            func_kwargs={"offset": 10},  # offset
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 3
+        # (item * multiplier) + offset
+        assert results[0][2] == (1 * 2) + 10  # 12
+        assert results[1][2] == (2 * 2) + 10  # 14
+        assert results[2][2] == (3 * 2) + 10  # 16
+        assert pit.completed == 3
+
+    def test_func_args_multiprocessing(self, db_path):
+        """Test that func_args works with multiprocessing mode."""
+        items = [1, 2, 3, 4, 5]
+        multiplier = 5
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args,
+            get_key,
+            db_path,
+            mode="multiprocessing",
+            workers=2,
+            func_args=(multiplier,),
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 5
+        assert results[0][2] == 1 * multiplier
+        assert results[1][2] == 2 * multiplier
+        assert pit.completed == 5
+        assert pit.errors == 0
+
+    def test_func_kwargs_multiprocessing(self, db_path):
+        """Test that func_kwargs works with multiprocessing mode."""
+        items = [1, 2, 3, 4, 5]
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args,
+            get_key,
+            db_path,
+            mode="multiprocessing",
+            workers=2,
+            func_kwargs={"multiplier": 6},
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 5
+        assert results[0][2] == 1 * 6
+        assert results[1][2] == 2 * 6
+        assert pit.completed == 5
+
+    def test_func_args_and_kwargs_multiprocessing(self, db_path):
+        """Test that func_args and func_kwargs work together with multiprocessing."""
+        items = [1, 2, 3]
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args_and_kwargs,
+            get_key,
+            db_path,
+            mode="multiprocessing",
+            workers=2,
+            func_args=(3,),  # multiplier
+            func_kwargs={"offset": 5},  # offset
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 3
+        # (item * multiplier) + offset
+        assert results[0][2] == (1 * 3) + 5  # 8
+        assert results[1][2] == (2 * 3) + 5  # 11
+        assert results[2][2] == (3 * 3) + 5  # 14
+        assert pit.completed == 3
+
+    def test_func_args_default_empty(self, db_path):
+        """Test that func_args defaults to empty tuple."""
+        items = [1, 2, 3]
+
+        # Should work without specifying func_args
+        with TrackedParallelIterator(
+            items,
+            process_with_args,
+            get_key,
+            db_path,
+            mode="multithreading",
+            # func_args not specified - should default to ()
+            func_kwargs={"multiplier": 2},
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 3
+        assert results[0][2] == 2
+        assert pit.completed == 3
 
 
 class TestInvalidInputs:

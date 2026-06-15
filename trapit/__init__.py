@@ -38,6 +38,8 @@ def _worker_process_item(
     db_path: Optional[str] = None,
     map_size: Optional[int] = None,
     repro: ReproType = "none",
+    func_args: tuple = (),
+    func_kwargs: dict = None,
 ) -> tuple[str, T, str, R | None | Exception]:
     """
     Process an item and return a tuple with status information.
@@ -46,6 +48,9 @@ def _worker_process_item(
         (status, item, key, result_or_error)
         where status is one of: COMPLETED, SKIPPED, ERROR
     """
+    if func_kwargs is None:
+        func_kwargs = {}
+    
     # Determine which environment to use
     if env is None:
         # Multiprocessing: each process opens its own
@@ -88,7 +93,7 @@ def _worker_process_item(
             pass
 
     try:
-        result = func(item)
+        result = func(item, *func_args, **func_kwargs)
         with env.begin(write=True) as txn:
             txn.put(key.encode(), b"1")
             # Clear any existing error marker for this key
@@ -135,6 +140,8 @@ class TrackedParallelIterator:
             - 'all': Process all items, ignoring existing state
             - Callable[[T], bool]: A function that takes an item and returns True
               if it should be processed.
+        func_args: Additional positional arguments to pass to func (default: ())
+        func_kwargs: Additional keyword arguments to pass to func (default: {})
         show_progress: Whether to show a Rich progress bar (default: True if TTY)
 
     Yields:
@@ -157,6 +164,8 @@ class TrackedParallelIterator:
         chunksize: int = 1,
         map_size: int = 1024 * 1024 * 1024,
         repro: ReproType = "none",
+        func_args: tuple = (),
+        func_kwargs: dict = None,
         show_progress: Optional[bool] = None,
     ):
         if workers is None:
@@ -174,6 +183,8 @@ class TrackedParallelIterator:
         self.chunksize = chunksize
         self.map_size = map_size
         self.repro = repro
+        self.func_args = func_args
+        self.func_kwargs = func_kwargs if func_kwargs is not None else {}
         self._pool = None
         self._executor = None
         self._env = None  # Shared environment for multithreading
@@ -227,6 +238,8 @@ class TrackedParallelIterator:
                 db_path=self.db_path,
                 map_size=self.map_size,
                 repro=self.repro,
+                func_args=self.func_args,
+                func_kwargs=self.func_kwargs,
             )
             self._iterator = self._pool.imap(
                 worker, self.iterable, chunksize=self.chunksize
@@ -243,6 +256,8 @@ class TrackedParallelIterator:
                 key_func=self.key_func,
                 env=self._env,
                 repro=self.repro,
+                func_args=self.func_args,
+                func_kwargs=self.func_kwargs,
             )
             self._iterator = self._executor.map(worker, self.iterable)
         else:
