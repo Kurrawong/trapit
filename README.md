@@ -77,6 +77,22 @@ try:
     do_something_with(result)
 except Exception as e:
     pit.log_error(item_key, e)
+
+# Pass additional arguments to your processing function
+def process_with_config(item: int, multiplier: int, offset: int = 0) -> int:
+    return (item * multiplier) + offset
+
+with TrackedParallelIterator(
+    items,
+    process_with_config,
+    get_key,
+    "./tracker_db",
+    mode="multiprocessing",
+    func_args=(3,),              # Pass multiplier=3 as positional arg
+    func_kwargs={"offset": 10},  # Pass offset=10 as keyword arg
+) as pit:
+    for item, item_key, result in pit:
+        print(f"Processed {item_key}: {result}")
 ```
 
 ## Reprocessing Modes
@@ -119,6 +135,7 @@ with TrackedParallelIterator(..., repro=should_reprocess) as pit:
 - **Processing Statistics**: Track completed, errored, and skipped item counts with `completed`, `errors`, and `skipped` properties
 - **3-tuple Yield**: Iteration now yields `(item, key, result)` for each successfully processed item
 - **Rich Progress Bar**: Built-in progress bar with ETA, displayed when running in a TTY
+- **Function Arguments**: Pass additional arguments to your processing function with `func_args` and `func_kwargs`
 
 ## Progress Bar
 
