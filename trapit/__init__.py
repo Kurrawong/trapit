@@ -4,6 +4,7 @@ TRAPIT - Tracked Async/Parallel Iterator with Rich Progress Bar
 Extended to include a Rich progress bar with ETA, only displayed if running in a TTY.
 """
 
+from collections.abc import Iterable
 import logging
 import pickle
 import sys
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
 from multiprocessing import Pool, cpu_count
-from typing import Callable, Hashable, Iterable, Optional, TypeVar, Union
+from typing import Callable, Hashable, Optional, TypeVar, Union
 
 import lmdb
 from rich.progress import BarColumn, Console, Progress, TextColumn, TimeRemainingColumn
@@ -140,7 +141,9 @@ class TrackedParallelIterator:
             - 'all': Process all items, ignoring existing state
             - Callable[[T], bool]: A function that takes an item and returns True
               if it should be processed.
-        func_args: Additional positional arguments to pass to func (default: ())
+        func_args: Additional positional arguments to pass to func. Can be a single value,
+            an iterable (tuple, list, etc.), or None. Non-iterable values (except strings/bytes)
+            are wrapped in a tuple. (default: None)
         func_kwargs: Additional keyword arguments to pass to func (default: {})
         show_progress: Whether to show a Rich progress bar (default: True if TTY)
 
@@ -164,8 +167,8 @@ class TrackedParallelIterator:
         chunksize: int = 1,
         map_size: int = 1024 * 1024 * 1024,
         repro: ReproType = "none",
-        func_args: tuple = (),
-        func_kwargs: dict = None,
+        func_args: tuple | None = None,
+        func_kwargs: dict | None = None,
         show_progress: Optional[bool] = None,
     ):
         if workers is None:
@@ -183,7 +186,14 @@ class TrackedParallelIterator:
         self.chunksize = chunksize
         self.map_size = map_size
         self.repro = repro
-        self.func_args = func_args
+        # Normalize func_args to a tuple
+        # Accept: None -> (), scalar -> (scalar,), iterable -> tuple(iterable)
+        if func_args is None:
+            self.func_args = ()
+        elif isinstance(func_args, Iterable) and not isinstance(func_args, (str, bytes)):
+            self.func_args = tuple(func_args)
+        else:
+            self.func_args = (func_args,)
         self.func_kwargs = func_kwargs if func_kwargs is not None else {}
         self._pool = None
         self._executor = None

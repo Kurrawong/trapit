@@ -874,6 +874,44 @@ class TestFuncArgsKwargs:
         assert results[0][2] == 2
         assert pit.completed == 3
 
+    def test_func_args_scalar(self, db_path):
+        """Test that func_args accepts a scalar value (not just tuple)."""
+        items = [1, 2, 3]
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args,
+            get_key,
+            db_path,
+            mode="multithreading",
+            func_args=5,  # Scalar, not a tuple
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 3
+        assert results[0][2] == 1 * 5
+        assert results[1][2] == 2 * 5
+        assert pit.completed == 3
+
+    def test_func_args_list(self, db_path):
+        """Test that func_args accepts a list (converted to tuple)."""
+        items = [1, 2, 3]
+
+        with TrackedParallelIterator(
+            items,
+            process_with_args_and_kwargs,
+            get_key,
+            db_path,
+            mode="multithreading",
+            func_args=[2],  # List, not tuple
+            func_kwargs={"offset": 10},
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 3
+        assert results[0][2] == (1 * 2) + 10  # 12
+        assert pit.completed == 3
+
 
 class TestInvalidInputs:
     """Test error handling for invalid inputs."""
