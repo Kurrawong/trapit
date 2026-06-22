@@ -4,11 +4,11 @@ TRAPIT - Tracked Async/Parallel Iterator with Rich Progress Bar
 Extended to include a Rich progress bar with ETA, only displayed if running in a TTY.
 """
 
-from collections.abc import Iterable
 import logging
 import pickle
 import sys
 import traceback
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
@@ -40,7 +40,7 @@ def _worker_process_item(
     map_size: Optional[int] = None,
     repro: ReproType = "none",
     func_args: tuple = (),
-    func_kwargs: dict = None,
+    func_kwargs: dict = dict(),
 ) -> tuple[str, T, str, R | None | Exception]:
     """
     Process an item and return a tuple with status information.
@@ -49,9 +49,6 @@ def _worker_process_item(
         (status, item, key, result_or_error)
         where status is one of: COMPLETED, SKIPPED, ERROR
     """
-    if func_kwargs is None:
-        func_kwargs = {}
-    
     # Determine which environment to use
     if env is None:
         # Multiprocessing: each process opens its own
@@ -190,7 +187,9 @@ class TrackedParallelIterator:
         # Accept: None -> (), scalar -> (scalar,), iterable -> tuple(iterable)
         if func_args is None:
             self.func_args = ()
-        elif isinstance(func_args, Iterable) and not isinstance(func_args, (str, bytes)):
+        elif isinstance(func_args, Iterable) and not isinstance(
+            func_args, (str, bytes)
+        ):
             self.func_args = tuple(func_args)
         else:
             self.func_args = (func_args,)
@@ -283,9 +282,9 @@ class TrackedParallelIterator:
             self._pool.join()
         elif self.mode == "multithreading" and self._executor:
             self._executor.shutdown(wait=True)
-            if self._env:
-                self._env.close()
-                self._env = None
+        if self._env:
+            self._env.close()
+            self._env = None
 
     def __iter__(self):
         """
