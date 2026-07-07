@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
 from multiprocessing import Pool, cpu_count
+from multiprocessing import util as multiprocessing_util
 from typing import Callable, Hashable, Optional, TypeVar, Union
 
 import lmdb
@@ -29,6 +30,42 @@ ReproType = Union[str, Callable[[T], bool]]
 SKIPPED = "__SKIPPED__"
 ERROR = "__ERROR__"
 COMPLETED = "__COMPLETED__"
+
+# Per-process LMDB environment used by multiprocessing workers.  This avoids
+# opening and closing the environment for every item, which can exhaust file
+# handles on Windows.
+_WORKER_ENV: Optional[lmdb.Environment] = None
+_WORKER_ENV_FINALIZER: Optional[multiprocessing_util.Finalize] = None
+
+
+def _close_worker_env() -> None:
+    """Close the multiprocessing worker's LMDB environment, if it is open."""
+    global _WORKER_ENV, _WORKER_ENV_FINALIZER
+    if _WORKER_ENV is not None:
+        _WORKER_ENV.close()
+        _WORKER_ENV = None
+    _WORKER_ENV_FINALIZER = None
+
+
+def _init_worker_env(db_path: str, map_size: int) -> None:
+    """Initialize the per-process LMDB environment for a pool worker."""
+    global _WORKER_ENV, _WORKER_ENV_FINALIZER
+
+    if _WORKER_ENV is not None:
+        _close_worker_env()
+
+    _WORKER_ENV = lmdb.open(db_path, map_size=map_size, writemap=True, readonly=False)
+    _WORKER_ENV_FINALIZER = multiprocessing_util.Finalize(
+        _WORKER_ENV, _close_worker_env, exitpriority=10
+    )
+
+
+def _get_worker_env(db_path: str, map_size: int) -> lmdb.Environment:
+    """Return the per-process LMDB environment, opening it if necessary."""
+    if _WORKER_ENV is None:
+        _init_worker_env(db_path, map_size)
+    assert _WORKER_ENV is not None
+    return _WORKER_ENV
 
 
 def _worker_process_item(
@@ -49,12 +86,12 @@ def _worker_process_item(
         (status, item, key, result_or_error)
         where status is one of: COMPLETED, SKIPPED, ERROR
     """
-    # Determine which environment to use
+    # Determine which environment to use.  Multithreading passes a shared env;
+    # multiprocessing workers use a per-process global initialized by the pool.
     if env is None:
-        # Multiprocessing: each process opens its own
         assert db_path is not None
         assert map_size is not None
-        env = lmdb.open(db_path, map_size=map_size, writemap=True, readonly=False)
+        env = _get_worker_env(db_path, map_size)
 
     key = key_func(item)
 
@@ -110,10 +147,6 @@ def _worker_process_item(
             txn.delete(key.encode())
         logging.error(e)
         return (ERROR, item, key, e)
-    finally:
-        # Close if we opened it ourselves (multiprocessing mode)
-        if env is not None and db_path is not None:
-            env.close()
 
 
 class TrackedParallelIterator:
@@ -239,7 +272,11 @@ class TrackedParallelIterator:
             )
 
         if self.mode == "multiprocessing":
-            self._pool = Pool(self.workers)
+            self._pool = Pool(
+                self.workers,
+                initializer=_init_worker_env,
+                initargs=(self.db_path, self.map_size),
+            )
             worker = partial(
                 _worker_process_item,
                 func=self.func,
