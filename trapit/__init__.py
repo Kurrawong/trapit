@@ -264,7 +264,7 @@ class TrackedParallelIterator:
             order. Defaults to False so progress can update as workers complete.
         worker_timeout: For multiprocessing, maximum seconds to wait for the next
             worker result before terminating the pool and raising TimeoutError.
-            Defaults to 5 seconds. Requires chunksize=1 unless set to None.
+            Defaults to 300 seconds. Requires chunksize=1 unless set to None.
         repro: Reprocessing mode - 'none', 'errors', 'all', or a callable
             - 'none': Skip items already processed (success or error)
             - 'errors': Only reprocess items that previously errored
@@ -299,7 +299,7 @@ class TrackedParallelIterator:
         map_resize_threshold: float = 0.8,
         map_resize_factor: float = 2.0,
         preserve_order: bool = False,
-        worker_timeout: Optional[float] = 5,
+        worker_timeout: Optional[float] = 300,
         repro: ReproType = "none",
         func_args: tuple | None = None,
         func_kwargs: dict | None = None,

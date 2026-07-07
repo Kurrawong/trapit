@@ -66,7 +66,7 @@ with TrackedParallelIterator(
     "./tracker_db",
     mode="multiprocessing",
     preserve_order=True,         # Optional: enforce input order
-    worker_timeout=300,          # Kill stalled workers after 300s; default is 5s
+    worker_timeout=300,          # Kill stalled workers after 300s; default is 300s
     func_args=(3,),              # Pass multiplier=3 as positional arg
     func_kwargs={"offset": 10},  # Pass offset=10 as keyword arg
 ) as pit:
@@ -146,7 +146,7 @@ with TrackedParallelIterator(..., mode="multiprocessing", preserve_order=True) a
     ...
 ```
 
-To terminate stalled workers, set `worker_timeout` to the maximum number of seconds to wait for the next result. It defaults to 5 seconds. This requires `chunksize=1`; set `worker_timeout=None` to disable timeout handling:
+To terminate stalled workers, set `worker_timeout` to the maximum number of seconds to wait for the next result. It defaults to 300 seconds. This requires `chunksize=1`; set `worker_timeout=None` to disable timeout handling:
 
 ```python
 with TrackedParallelIterator(..., mode="multiprocessing", worker_timeout=300) as pit:
