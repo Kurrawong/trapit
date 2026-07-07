@@ -104,6 +104,13 @@ def slow_process_item(item: int) -> int:
     return item * 2
 
 
+def process_item_slow_first(item: int) -> int:
+    """Processing function where the first input finishes last."""
+    if item == 0:
+        time.sleep(0.1)
+    return item * 2
+
+
 class TestBasicProcessing:
     """Test basic processing functionality."""
 
@@ -427,6 +434,31 @@ class TestStatusCleanup:
         env.close()
         assert has_error
         assert not has_success
+
+
+class TestMultithreadingMode:
+    """Test multithreading mode."""
+
+    def test_multithreading_defaults_to_unordered_results(self, db_path):
+        """Test multithreading yields results as workers complete by default."""
+        items = [0, 1, 2, 3]
+
+        with TrackedParallelIterator(
+            items,
+            process_item_slow_first,
+            get_key,
+            db_path,
+            mode="multithreading",
+            workers=4,
+        ) as pit:
+            results = list(pit)
+
+        result_items = [item for item, _, _ in results]
+        assert sorted(result_items) == items
+        assert result_items[0] != 0
+        assert pit.completed == 4
+        assert pit.errors == 0
+        assert pit.skipped == 0
 
 
 class TestMultiprocessingMode:

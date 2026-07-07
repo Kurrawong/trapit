@@ -10,7 +10,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from functools import partial
 from multiprocessing import Pool, TimeoutError as MultiprocessingTimeoutError, cpu_count
@@ -124,6 +124,32 @@ def _get_worker_env(db_path: str, map_size: int) -> lmdb.Environment:
     return _WORKER_ENV
 
 
+def _unordered_thread_map(
+    executor: ThreadPoolExecutor,
+    worker: Callable[[T], tuple[str, T, str, R | None | Exception]],
+    iterable: Iterable[T],
+    max_pending: int,
+):
+    """Yield thread-pool results as they complete without submitting all items at once."""
+    item_iterator = iter(iterable)
+    pending = set()
+
+    try:
+        for _ in range(max_pending):
+            pending.add(executor.submit(worker, next(item_iterator)))
+    except StopIteration:
+        pass
+
+    while pending:
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            yield future.result()
+            try:
+                pending.add(executor.submit(worker, next(item_iterator)))
+            except StopIteration:
+                pass
+
+
 def _worker_process_item(
     item: T,
     func: Callable[[T], R],
@@ -234,8 +260,8 @@ class TrackedParallelIterator:
         map_resize_threshold: Grow the LMDB map when approximate usage reaches
             this fraction of the current map size. Defaults to 0.8.
         map_resize_factor: Multiplier used when growing the LMDB map. Defaults to 2.0.
-        preserve_order: For multiprocessing, yield results in input order. Defaults to
-            False so progress can update as workers complete, especially on Windows.
+        preserve_order: For multiprocessing and multithreading, yield results in input
+            order. Defaults to False so progress can update as workers complete.
         worker_timeout: For multiprocessing, maximum seconds to wait for the next
             worker result before terminating the pool and raising TimeoutError.
             Defaults to 5 seconds. Requires chunksize=1 unless set to None.
@@ -408,7 +434,12 @@ class TrackedParallelIterator:
             )
             if self.mode == "multithreading":
                 self._executor = ThreadPoolExecutor(max_workers=self.workers)
-                self._iterator = self._executor.map(worker, self.iterable)
+                if not self.preserve_order:
+                    self._iterator = _unordered_thread_map(
+                        self._executor, worker, self.iterable, self.workers
+                    )
+                else:
+                    self._iterator = self._executor.map(worker, self.iterable)
             else:
                 self._iterator = map(worker, self.iterable)
         else:
