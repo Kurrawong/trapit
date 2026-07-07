@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, TimeoutError as MultiprocessingTimeoutError, cpu_count
 from multiprocessing import util as multiprocessing_util
 from typing import Callable, Hashable, Optional, TypeVar, Union
 
@@ -153,18 +153,24 @@ class TrackedParallelIterator:
     """
     A parallel iterator that tracks processed items in LMDB.
 
-    Supports multiprocessing and multithreading modes with configurable
-    reprocessing behavior and an optional Rich progress bar.
+    Supports multiprocessing, multithreading, and singlethreaded modes with
+    configurable reprocessing behavior and an optional Rich progress bar.
 
     Args:
         iterable: The input items to process
         func: Function to apply to each item
-        key_func: Function to generate a unique string key for each item
-        db_path: Path to the LMDB database directory
-        mode: 'multiprocessing' or 'multithreading'
+        key_func: Function to generate a unique string key for each item. Defaults
+            to str(item).
+        db_path: Path to the LMDB database directory. Defaults to ".trapit".
+        mode: 'multiprocessing', 'multithreading', or 'singlethreaded'
         workers: Number of parallel workers. Defaults to cpu_count - 1
         chunksize: For multiprocessing, number of items per chunk
         map_size: LMDB map size in bytes
+        preserve_order: For multiprocessing, yield results in input order. Defaults to
+            False so progress can update as workers complete, especially on Windows.
+        worker_timeout: For multiprocessing, maximum seconds to wait for the next
+            worker result before terminating the pool and raising TimeoutError.
+            Defaults to 5 seconds. Requires chunksize=1 unless set to None.
         repro: Reprocessing mode - 'none', 'errors', 'all', or a callable
             - 'none': Skip items already processed (success or error)
             - 'errors': Only reprocess items that previously errored
@@ -190,12 +196,14 @@ class TrackedParallelIterator:
         self,
         iterable: Iterable[T],
         func: Callable[[T], R],
-        key_func: Callable[[T], str],
-        db_path: str,
+        key_func: Callable[[T], str] | None = None,
+        db_path: str = ".trapit",
         mode: str = "multiprocessing",
         workers: Optional[int] = None,
         chunksize: int = 1,
         map_size: int = 1024 * 1024 * 1024,
+        preserve_order: bool = False,
+        worker_timeout: Optional[float] = 5,
         repro: ReproType = "none",
         func_args: tuple | None = None,
         func_kwargs: dict | None = None,
@@ -203,10 +211,18 @@ class TrackedParallelIterator:
     ):
         if workers is None:
             workers = max(1, cpu_count() - 1)
+
+        if key_func is None:
+            key_func = str
+        elif not callable(key_func):
+            raise ValueError("key_func must be callable")
+
         if not callable(repro) and repro not in ("none", "errors", "all"):
             raise ValueError(
                 f"repro must be 'none', 'errors', 'all', or a callable, got '{repro}'"
             )
+        if worker_timeout is not None and chunksize != 1:
+            raise ValueError("worker_timeout requires chunksize=1")
         self.iterable = iterable
         self.func = func
         self.key_func = key_func
@@ -215,6 +231,8 @@ class TrackedParallelIterator:
         self.workers = workers
         self.chunksize = chunksize
         self.map_size = map_size
+        self.preserve_order = preserve_order
+        self.worker_timeout = worker_timeout
         self.repro = repro
         # Normalize func_args to a tuple
         # Accept: None -> (), scalar -> (scalar,), iterable -> tuple(iterable)
@@ -228,6 +246,7 @@ class TrackedParallelIterator:
             self.func_args = (func_args,)
         self.func_kwargs = func_kwargs if func_kwargs is not None else {}
         self._pool = None
+        self._pool_terminated = False
         self._executor = None
         self._env = None  # Shared environment for multithreading
         # Counters for tracking progress
@@ -250,6 +269,7 @@ class TrackedParallelIterator:
 
     def __enter__(self):
         # Reset counters when entering context
+        self._pool_terminated = False
         self._completed_count = 0
         self._error_count = 0
         self._skipped_count = 0
@@ -287,12 +307,13 @@ class TrackedParallelIterator:
                 func_args=self.func_args,
                 func_kwargs=self.func_kwargs,
             )
-            self._iterator = self._pool.imap(
-                worker, self.iterable, chunksize=self.chunksize
+            map_method = (
+                self._pool.imap if self.preserve_order else self._pool.imap_unordered
             )
-        elif self.mode == "multithreading":
-            self._executor = ThreadPoolExecutor(max_workers=self.workers)
-            # Open environment once for all threads to share
+            self._iterator = map_method(worker, self.iterable, chunksize=self.chunksize)
+        elif self.mode in ("multithreading", "singlethreaded"):
+            # Open environment once for all threads, or once for the current
+            # process in singlethreaded mode.
             self._env = lmdb.open(
                 self.db_path, map_size=self.map_size, writemap=True, readonly=False
             )
@@ -305,9 +326,15 @@ class TrackedParallelIterator:
                 func_args=self.func_args,
                 func_kwargs=self.func_kwargs,
             )
-            self._iterator = self._executor.map(worker, self.iterable)
+            if self.mode == "multithreading":
+                self._executor = ThreadPoolExecutor(max_workers=self.workers)
+                self._iterator = self._executor.map(worker, self.iterable)
+            else:
+                self._iterator = map(worker, self.iterable)
         else:
-            raise ValueError("mode must be 'multiprocessing' or 'multithreading'")
+            raise ValueError(
+                "mode must be 'multiprocessing', 'multithreading', or 'singlethreaded'"
+            )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -315,8 +342,9 @@ class TrackedParallelIterator:
             self._progress.stop()
 
         if self.mode == "multiprocessing" and self._pool:
-            self._pool.close()
-            self._pool.join()
+            if not self._pool_terminated:
+                self._pool.close()
+                self._pool.join()
         elif self.mode == "multithreading" and self._executor:
             self._executor.shutdown(wait=True)
         if self._env:
@@ -331,7 +359,24 @@ class TrackedParallelIterator:
             tuple: (item, key, result) for each successfully processed item.
             Skipped and errored items are not yielded but are counted.
         """
-        for result in self._iterator:
+        while True:
+            try:
+                if self.mode == "multiprocessing" and self.worker_timeout is not None:
+                    result = self._iterator.next(timeout=self.worker_timeout)
+                else:
+                    result = next(self._iterator)
+            except StopIteration:
+                break
+            except MultiprocessingTimeoutError as exc:
+                if self._pool is not None:
+                    self._pool.terminate()
+                    self._pool.join()
+                    self._pool_terminated = True
+                raise TimeoutError(
+                    f"No multiprocessing worker result received within "
+                    f"{self.worker_timeout} seconds; worker pool was terminated"
+                ) from exc
+
             if result is None:
                 continue
             status, item, key, data = result

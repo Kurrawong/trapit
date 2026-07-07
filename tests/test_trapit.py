@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import time
 
 import lmdb
 import pytest
@@ -97,6 +98,12 @@ def process_with_args_and_kwargs(item: int, multiplier: int, offset: int = 0) ->
     return (item * multiplier) + offset
 
 
+def slow_process_item(item: int) -> int:
+    """Processing function that sleeps long enough to trigger worker timeout."""
+    time.sleep(1)
+    return item * 2
+
+
 class TestBasicProcessing:
     """Test basic processing functionality."""
 
@@ -118,6 +125,45 @@ class TestBasicProcessing:
         assert pit.completed == 5
         assert pit.errors == 0
         assert pit.skipped == 0
+
+    def test_default_key_func(self, db_path):
+        """Test that key_func defaults to str(item)."""
+        items = [1, 2, 3]
+
+        with TrackedParallelIterator(
+            items, process_item_success, db_path=db_path, mode="multithreading"
+        ) as pit:
+            results = list(pit)
+
+        assert [result[1] for result in results] == ["1", "2", "3"]
+        assert pit.completed == 3
+
+    def test_singlethreaded_mode(self, db_path):
+        """Test basic processing in singlethreaded mode."""
+        items = [1, 2, 3]
+
+        with TrackedParallelIterator(
+            items, process_item_success, get_key, db_path, mode="singlethreaded"
+        ) as pit:
+            results = list(pit)
+
+        assert results == [(1, "item_1", 2), (2, "item_2", 4), (3, "item_3", 6)]
+        assert pit.completed == 3
+        assert pit.errors == 0
+        assert pit.skipped == 0
+
+    def test_default_db_path(self, tmp_path, monkeypatch):
+        """Test that db_path defaults to .trapit."""
+        monkeypatch.chdir(tmp_path)
+
+        with TrackedParallelIterator(
+            [1, 2, 3], process_item_success, mode="multithreading"
+        ) as pit:
+            results = list(pit)
+
+        assert len(results) == 3
+        assert [result[1] for result in results] == ["1", "2", "3"]
+        assert (tmp_path / ".trapit").exists()
 
     def test_skip_already_processed(self, db_path):
         """Test that already processed items are skipped with repro='none'."""
@@ -801,6 +847,7 @@ class TestFuncArgsKwargs:
             db_path,
             mode="multiprocessing",
             workers=2,
+            preserve_order=True,
             func_args=(multiplier,),
         ) as pit:
             results = list(pit)
@@ -822,6 +869,7 @@ class TestFuncArgsKwargs:
             db_path,
             mode="multiprocessing",
             workers=2,
+            preserve_order=True,
             func_kwargs={"multiplier": 6},
         ) as pit:
             results = list(pit)
@@ -842,6 +890,7 @@ class TestFuncArgsKwargs:
             db_path,
             mode="multiprocessing",
             workers=2,
+            preserve_order=True,
             func_args=(3,),  # multiplier
             func_kwargs={"offset": 5},  # offset
         ) as pit:
@@ -938,3 +987,30 @@ class TestInvalidInputs:
                 mode="invalid",
             ):
                 pass
+
+    def test_worker_timeout_requires_chunksize_one(self, db_path):
+        """Test that worker_timeout requires chunksize=1."""
+        with pytest.raises(ValueError, match="worker_timeout requires chunksize=1"):
+            TrackedParallelIterator(
+                [1, 2, 3],
+                process_item_success,
+                get_key,
+                db_path,
+                mode="multiprocessing",
+                chunksize=2,
+                worker_timeout=1,
+            )
+
+    def test_worker_timeout_terminates_pool(self, db_path):
+        """Test that worker_timeout raises TimeoutError for stalled workers."""
+        with pytest.raises(TimeoutError, match="worker pool was terminated"):
+            with TrackedParallelIterator(
+                [1],
+                slow_process_item,
+                get_key,
+                db_path,
+                mode="multiprocessing",
+                workers=1,
+                worker_timeout=0.1,
+            ) as pit:
+                list(pit)

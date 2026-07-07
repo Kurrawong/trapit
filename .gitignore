@@ -21,3 +21,6 @@ test_lmdb_*
 
 # UV lock file (optional - can be regenerated)
 # uv.lock
+
+# meow.review annotation store
+/.cache/meow-review/annotations.json
