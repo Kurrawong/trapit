@@ -5,14 +5,14 @@ Extended to include a Rich progress bar with ETA, only displayed if running in a
 """
 
 import logging
-import pickle
+import queue
 import sys
 import threading
-import traceback
+from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime
 from functools import partial
+from time import monotonic
 from multiprocessing import Pool, TimeoutError as MultiprocessingTimeoutError, cpu_count
 from multiprocessing import util as multiprocessing_util
 from typing import Callable, Hashable, Optional, TypeVar, Union
@@ -31,6 +31,8 @@ ReproType = Union[str, Callable[[T], bool]]
 SKIPPED = "__SKIPPED__"
 ERROR = "__ERROR__"
 COMPLETED = "__COMPLETED__"
+SUCCESS_MARKER = b"0"
+ERROR_MARKER = b"1"
 
 # Per-process LMDB environment used by multiprocessing workers.  This avoids
 # opening and closing the environment for every item, which can exhaust file
@@ -94,6 +96,156 @@ def _write_with_dynamic_map(
             )
 
 
+def _key_bytes(key: str) -> bytes:
+    """Return LMDB key bytes for a marker key."""
+    if not isinstance(key, str):
+        raise TypeError(f"key_func must return str, got {type(key).__name__}")
+    return key.encode()
+
+
+def _write_markers_with_dynamic_map(
+    env: lmdb.Environment,
+    markers: list[tuple[str, Optional[bytes]]],
+    threshold: float,
+    resize_factor: float,
+) -> None:
+    """Write success/error markers in one transaction."""
+
+    # If the same key appears multiple times in a batch, only the final state
+    # matters. Coalescing reduces LMDB puts/deletes for duplicate keys.
+    latest_markers = dict(markers)
+
+    def write_markers(txn: lmdb.Transaction) -> None:
+        for key, error_payload in latest_markers.items():
+            key_bytes = _key_bytes(key)
+            if error_payload is None:
+                txn.put(key_bytes, SUCCESS_MARKER)
+            else:
+                txn.put(key_bytes, error_payload)
+
+    _write_with_dynamic_map(env, write_markers, threshold, resize_factor)
+
+
+class _QueuedMarkerWriter:
+    """Single LMDB writer thread that batches marker updates."""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        db_path: str,
+        map_size: int,
+        threshold: float,
+        resize_factor: float,
+        batch_size: int,
+        flush_interval: float,
+        env: Optional[lmdb.Environment] = None,
+    ) -> None:
+        self._db_path = db_path
+        self._map_size = map_size
+        self._threshold = threshold
+        self._resize_factor = resize_factor
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval
+        self._env = env
+        self._owns_env = env is None
+        queue_size = max(batch_size * 4, 1)
+        self._queue: queue.Queue[tuple[str, Optional[bytes]] | object] = queue.Queue(
+            maxsize=queue_size
+        )
+        self._closed = False
+        self._state_lock = threading.Lock()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="trapit-lmdb-writer",
+            daemon=False,
+        )
+        self._thread.start()
+
+    def enqueue(self, key: str, error_payload: Optional[bytes]) -> None:
+        while True:
+            self._raise_if_failed()
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("queued marker writer is closed")
+            try:
+                self._queue.put((key, error_payload), timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def close(self) -> None:
+        with self._state_lock:
+            already_closed = self._closed
+            self._closed = True
+        if already_closed:
+            self._raise_if_failed()
+            return
+        while True:
+            self._raise_if_failed()
+            try:
+                self._queue.put(self._STOP, timeout=0.1)
+                break
+            except queue.Full:
+                continue
+        self._thread.join()
+        self._raise_if_failed()
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("queued marker writer failed") from self._error
+
+    def _run(self) -> None:
+        env = self._env
+        if env is None:
+            env = lmdb.open(
+                self._db_path,
+                map_size=self._map_size,
+                writemap=True,
+                readonly=False,
+            )
+        batch: list[tuple[str, Optional[bytes]]] = []
+        try:
+            next_flush = monotonic() + self._flush_interval
+            while True:
+                timeout = max(0.0, next_flush - monotonic())
+                try:
+                    if self._flush_interval == 0 and not batch:
+                        item = self._queue.get()
+                    else:
+                        item = self._queue.get(timeout=timeout)
+                except queue.Empty:
+                    if batch:
+                        _write_markers_with_dynamic_map(
+                            env, batch, self._threshold, self._resize_factor
+                        )
+                        batch.clear()
+                    next_flush = monotonic() + self._flush_interval
+                    continue
+
+                if item is self._STOP:
+                    if batch:
+                        _write_markers_with_dynamic_map(
+                            env, batch, self._threshold, self._resize_factor
+                        )
+                        batch.clear()
+                    return
+
+                batch.append(item)  # type: ignore[arg-type]
+                if len(batch) >= self._batch_size:
+                    _write_markers_with_dynamic_map(
+                        env, batch, self._threshold, self._resize_factor
+                    )
+                    batch.clear()
+                    next_flush = monotonic() + self._flush_interval
+        except Exception as exc:
+            self._error = exc
+        finally:
+            if self._owns_env and env is not None:
+                env.close()
+
+
 def _close_worker_env() -> None:
     """Close the multiprocessing worker's LMDB environment, if it is open."""
     global _WORKER_ENV, _WORKER_ENV_FINALIZER
@@ -126,28 +278,58 @@ def _get_worker_env(db_path: str, map_size: int) -> lmdb.Environment:
 
 def _unordered_thread_map(
     executor: ThreadPoolExecutor,
-    worker: Callable[[T], tuple[str, T, str, R | None | Exception]],
+    worker: Callable[[T], tuple[str, T, str, R | None | Exception, Optional[bytes]]],
     iterable: Iterable[T],
     max_pending: int,
 ):
     """Yield thread-pool results as they complete without submitting all items at once."""
     item_iterator = iter(iterable)
-    pending = set()
+    pending = []
 
     try:
         for _ in range(max_pending):
-            pending.add(executor.submit(worker, next(item_iterator)))
+            pending.append(executor.submit(worker, next(item_iterator)))
     except StopIteration:
         pass
 
     while pending:
-        done, pending = wait(pending, return_when=FIRST_COMPLETED)
-        for future in done:
-            yield future.result()
-            try:
-                pending.add(executor.submit(worker, next(item_iterator)))
-            except StopIteration:
-                pass
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        remaining = []
+        for future in pending:
+            if future in done:
+                yield future.result()
+                try:
+                    remaining.append(executor.submit(worker, next(item_iterator)))
+                except StopIteration:
+                    pass
+            else:
+                remaining.append(future)
+        pending = remaining
+
+
+def _ordered_thread_map(
+    executor: ThreadPoolExecutor,
+    worker: Callable[[T], tuple[str, T, str, R | None | Exception, Optional[bytes]]],
+    iterable: Iterable[T],
+    max_pending: int,
+):
+    """Yield thread-pool results in input order without submitting all items."""
+    item_iterator = iter(iterable)
+    pending: deque = deque()
+
+    try:
+        for _ in range(max_pending):
+            pending.append(executor.submit(worker, next(item_iterator)))
+    except StopIteration:
+        pass
+
+    while pending:
+        future = pending.popleft()
+        yield future.result()
+        try:
+            pending.append(executor.submit(worker, next(item_iterator)))
+        except StopIteration:
+            pass
 
 
 def _worker_process_item(
@@ -159,10 +341,11 @@ def _worker_process_item(
     map_size: Optional[int] = None,
     repro: ReproType = "none",
     func_args: tuple = (),
-    func_kwargs: dict = dict(),
+    func_kwargs: Optional[dict] = None,
     map_resize_threshold: float = 0.8,
     map_resize_factor: float = 2.0,
-) -> tuple[str, T, str, R | None | Exception]:
+    defer_writes: bool = False,
+) -> tuple[str, T, str, R | None | Exception, Optional[bytes]]:
     """
     Process an item and return a tuple with status information.
 
@@ -177,67 +360,69 @@ def _worker_process_item(
         assert map_size is not None
         env = _get_worker_env(db_path, map_size)
 
+    if func_kwargs is None:
+        func_kwargs = {}
+
     key = key_func(item)
+    key_bytes = _key_bytes(key)
 
     # Check if repro is a callable - if so, use it to determine processing
     # The LMDB tracker is ignored for the decision, but still used for marking
     if callable(repro):
         should_process = repro(item)
         if not should_process:
-            return (SKIPPED, item, key, None)
+            return (SKIPPED, item, key, None, None)
     else:
         # repro is a string mode
         try:
             with env.begin() as txn:
-                has_success = txn.get(key.encode()) is not None
-                has_error = txn.get(f"error:{key}".encode()) is not None
-
-                if repro == "none":
-                    # Skip if already processed (success or error)
-                    if has_success or has_error:
-                        return (SKIPPED, item, key, None)
-                elif repro == "errors":
-                    # Only process items that have errors but no success (retry failures)
-                    if not has_error or has_success:
-                        return (SKIPPED, item, key, None)
-                elif repro == "all":
-                    # Process everything, ignore existing state
-                    pass
-                else:
-                    raise ValueError(
-                        f"repro must be 'none', 'errors', 'all', or a callable, got '{repro}'"
-                    )
-        except Exception:
-            # If we can't read from the database, proceed with processing
-            pass
+                marker = txn.get(key_bytes)
+                has_success = marker == SUCCESS_MARKER
+                has_error = marker == ERROR_MARKER
+        except lmdb.Error as exc:
+            # If we can't read from the database, proceed with processing.
+            logging.warning("Failed to read tracker state for key %r: %s", key, exc)
+        else:
+            if repro == "none":
+                # Skip if already processed (success or error)
+                if has_success or has_error:
+                    return (SKIPPED, item, key, None, None)
+            elif repro == "errors":
+                # Only process items currently marked as errors (retry failures)
+                if not has_error or has_success:
+                    return (SKIPPED, item, key, None, None)
+            elif repro == "all":
+                # Process everything, ignore existing state
+                pass
+            else:
+                raise ValueError(
+                    f"repro must be 'none', 'errors', 'all', or a callable, got '{repro}'"
+                )
 
     try:
         result = func(item, *func_args, **func_kwargs)
 
-        def write_success(txn: lmdb.Transaction) -> None:
-            txn.put(key.encode(), b"1")
-            # Clear any existing error marker for this key
-            txn.delete(f"error:{key}".encode())
+        if not defer_writes:
 
-        _write_with_dynamic_map(
-            env, write_success, map_resize_threshold, map_resize_factor
-        )
-        return (COMPLETED, item, key, result)
+            def write_success(txn: lmdb.Transaction) -> None:
+                txn.put(key_bytes, SUCCESS_MARKER)
+
+            _write_with_dynamic_map(
+                env, write_success, map_resize_threshold, map_resize_factor
+            )
+        return (COMPLETED, item, key, result, None)
     except Exception as e:
-        error_data = {
-            "timestamp": datetime.now().isoformat(),
-            "error_type": type(e).__name__,
-            "error_message": str(e),
-            "traceback": traceback.format_exc(),
-        }
-        def write_error(txn: lmdb.Transaction) -> None:
-            txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
-            # Clear any existing success marker for this key
-            txn.delete(key.encode())
+        error_payload = ERROR_MARKER
+        if not defer_writes:
 
-        _write_with_dynamic_map(env, write_error, map_resize_threshold, map_resize_factor)
-        logging.error(e)
-        return (ERROR, item, key, e)
+            def write_error(txn: lmdb.Transaction) -> None:
+                txn.put(key_bytes, error_payload)
+
+            _write_with_dynamic_map(
+                env, write_error, map_resize_threshold, map_resize_factor
+            )
+        logging.exception("Error processing key %r", key)
+        return (ERROR, item, key, e, error_payload)
 
 
 class TrackedParallelIterator:
@@ -276,6 +461,14 @@ class TrackedParallelIterator:
             are wrapped in a tuple. (default: None)
         func_kwargs: Additional keyword arguments to pass to func (default: {})
         show_progress: Whether to show a Rich progress bar (default: True if TTY)
+        batch_writes: If True (default), workers defer success/error marker writes
+            to a single queued LMDB writer thread that flushes batches periodically.
+            This reduces write contention while still persisting progress during
+            long runs. Pending writes are flushed when iteration exits.
+        write_batch_size: Maximum number of status updates per LMDB transaction
+            when batch_writes=True.
+        write_flush_interval: Maximum seconds to keep a partial write batch in
+            memory before flushing it when batch_writes=True.
 
     Yields:
         tuple: (item, key, result) for each successfully processed item.
@@ -304,9 +497,23 @@ class TrackedParallelIterator:
         func_args: tuple | None = None,
         func_kwargs: dict | None = None,
         show_progress: Optional[bool] = None,
+        batch_writes: bool = True,
+        write_batch_size: int = 1000,
+        write_flush_interval: float = 0.5,
     ):
         if workers is None:
             workers = max(1, cpu_count() - 1)
+
+        if mode not in ("multiprocessing", "multithreading", "singlethreaded"):
+            raise ValueError(
+                "mode must be 'multiprocessing', 'multithreading', or 'singlethreaded'"
+            )
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        if chunksize < 1:
+            raise ValueError("chunksize must be at least 1")
+        if map_size < 1:
+            raise ValueError("map_size must be positive")
 
         if key_func is None:
             key_func = str
@@ -323,6 +530,10 @@ class TrackedParallelIterator:
             raise ValueError("map_resize_threshold must be between 0 and 1")
         if map_resize_factor <= 1:
             raise ValueError("map_resize_factor must be greater than 1")
+        if write_batch_size < 1:
+            raise ValueError("write_batch_size must be at least 1")
+        if write_flush_interval < 0:
+            raise ValueError("write_flush_interval must be non-negative")
         self.iterable = iterable
         self.func = func
         self.key_func = key_func
@@ -336,6 +547,9 @@ class TrackedParallelIterator:
         self.preserve_order = preserve_order
         self.worker_timeout = worker_timeout
         self.repro = repro
+        self.batch_writes = batch_writes
+        self.write_batch_size = write_batch_size
+        self.write_flush_interval = write_flush_interval
         # Normalize func_args to a tuple
         # Accept: None -> (), scalar -> (scalar,), iterable -> tuple(iterable)
         if func_args is None:
@@ -351,6 +565,11 @@ class TrackedParallelIterator:
         self._pool_terminated = False
         self._executor = None
         self._env = None  # Shared environment for multithreading
+        self._iterator = None
+        self._entered = False
+        self._exhausted = False
+        self._deferred_writes: list[tuple[str, Optional[bytes]]] = []
+        self._batch_writer: Optional[_QueuedMarkerWriter] = None
         # Counters for tracking progress
         self._completed_count = 0
         self._error_count = 0
@@ -370,6 +589,10 @@ class TrackedParallelIterator:
         self._progress = None
 
     def __enter__(self):
+        if self._entered:
+            raise RuntimeError("TrackedParallelIterator cannot be re-entered")
+        self._entered = True
+        self._exhausted = False
         # Reset counters when entering context
         self._pool_terminated = False
         self._completed_count = 0
@@ -382,6 +605,11 @@ class TrackedParallelIterator:
                 BarColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 TextColumn("[progress.completed]{task.completed}/{task.total}"),
+                TextColumn(
+                    "completed={task.fields[completed_count]} "
+                    "errors={task.fields[error_count]} "
+                    "skipped={task.fields[skipped_count]}"
+                ),
                 TimeRemainingColumn(),
                 console=Console(),
                 expand=True,
@@ -391,6 +619,9 @@ class TrackedParallelIterator:
                 "Processing",
                 total=self._total,
                 completed=0,
+                completed_count=self._completed_count,
+                error_count=self._error_count,
+                skipped_count=self._skipped_count,
             )
 
         if self.mode == "multiprocessing":
@@ -410,6 +641,7 @@ class TrackedParallelIterator:
                 func_kwargs=self.func_kwargs,
                 map_resize_threshold=self.map_resize_threshold,
                 map_resize_factor=self.map_resize_factor,
+                defer_writes=self.batch_writes,
             )
             map_method = (
                 self._pool.imap if self.preserve_order else self._pool.imap_unordered
@@ -431,6 +663,7 @@ class TrackedParallelIterator:
                 func_kwargs=self.func_kwargs,
                 map_resize_threshold=self.map_resize_threshold,
                 map_resize_factor=self.map_resize_factor,
+                defer_writes=self.batch_writes,
             )
             if self.mode == "multithreading":
                 self._executor = ThreadPoolExecutor(max_workers=self.workers)
@@ -439,28 +672,56 @@ class TrackedParallelIterator:
                         self._executor, worker, self.iterable, self.workers
                     )
                 else:
-                    self._iterator = self._executor.map(worker, self.iterable)
+                    self._iterator = _ordered_thread_map(
+                        self._executor, worker, self.iterable, self.workers
+                    )
             else:
                 self._iterator = map(worker, self.iterable)
-        else:
-            raise ValueError(
-                "mode must be 'multiprocessing', 'multithreading', or 'singlethreaded'"
+
+        if self.batch_writes:
+            self._batch_writer = _QueuedMarkerWriter(
+                db_path=self.db_path,
+                map_size=self.map_size,
+                threshold=self.map_resize_threshold,
+                resize_factor=self.map_resize_factor,
+                batch_size=self.write_batch_size,
+                flush_interval=self.write_flush_interval,
+                env=self._env,
             )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._progress:
-            self._progress.stop()
+        cleanup_error: BaseException | None = None
+        try:
+            self._flush_deferred_writes()
+        except BaseException as exc:
+            cleanup_error = exc
+        finally:
+            try:
+                if self.mode == "multiprocessing" and self._pool:
+                    if not self._pool_terminated:
+                        if exc_type is not None or not self._exhausted:
+                            self._pool.terminate()
+                            self._pool_terminated = True
+                        else:
+                            self._pool.close()
+                        self._pool.join()
+                elif self.mode == "multithreading" and self._executor:
+                    self._executor.shutdown(
+                        wait=True,
+                        cancel_futures=(exc_type is not None or not self._exhausted),
+                    )
+            finally:
+                if self._env:
+                    self._env.close()
+                    self._env = None
+                if self._progress:
+                    self._progress.stop()
+                    self._progress = None
+                self._entered = False
 
-        if self.mode == "multiprocessing" and self._pool:
-            if not self._pool_terminated:
-                self._pool.close()
-                self._pool.join()
-        elif self.mode == "multithreading" and self._executor:
-            self._executor.shutdown(wait=True)
-        if self._env:
-            self._env.close()
-            self._env = None
+        if cleanup_error is not None and exc_type is None:
+            raise cleanup_error
 
     def __iter__(self):
         """
@@ -470,40 +731,105 @@ class TrackedParallelIterator:
             tuple: (item, key, result) for each successfully processed item.
             Skipped and errored items are not yielded but are counted.
         """
-        while True:
-            try:
-                if self.mode == "multiprocessing" and self.worker_timeout is not None:
-                    result = self._iterator.next(timeout=self.worker_timeout)
-                else:
-                    result = next(self._iterator)
-            except StopIteration:
-                break
-            except MultiprocessingTimeoutError as exc:
-                if self._pool is not None:
-                    self._pool.terminate()
-                    self._pool.join()
-                    self._pool_terminated = True
-                raise TimeoutError(
-                    f"No multiprocessing worker result received within "
-                    f"{self.worker_timeout} seconds; worker pool was terminated"
-                ) from exc
+        if not self._entered or self._iterator is None:
+            raise RuntimeError(
+                "TrackedParallelIterator must be used as a context manager"
+            )
 
-            if result is None:
-                continue
-            status, item, key, data = result
-            if status == COMPLETED:
-                self._completed_count += 1
-                if self._progress:
-                    self._progress.update(self._task_id, advance=1)
-                yield (item, key, data)
-            elif status == SKIPPED:
-                self._skipped_count += 1
-                if self._progress:
-                    self._progress.update(self._task_id, advance=1)
-            elif status == ERROR:
-                self._error_count += 1
-                if self._progress:
-                    self._progress.update(self._task_id, advance=1)
+        try:
+            while True:
+                try:
+                    if (
+                        self.mode == "multiprocessing"
+                        and self.worker_timeout is not None
+                    ):
+                        result = self._iterator.next(timeout=self.worker_timeout)
+                    else:
+                        result = next(self._iterator)
+                except StopIteration:
+                    self._exhausted = True
+                    break
+                except MultiprocessingTimeoutError as exc:
+                    if self._pool is not None:
+                        self._pool.terminate()
+                        self._pool.join()
+                        self._pool_terminated = True
+                    raise TimeoutError(
+                        f"No multiprocessing worker result received within "
+                        f"{self.worker_timeout} seconds; worker pool was terminated"
+                    ) from exc
+
+                if result is None:
+                    logging.warning("Worker returned None; skipping result")
+                    continue
+                status, item, key, data, error_payload = result
+                if status == COMPLETED:
+                    self._completed_count += 1
+                    if self.batch_writes:
+                        self._queue_marker_write(key, None)
+                    self._update_progress(advance=1)
+                    yield (item, key, data)
+                elif status == SKIPPED:
+                    self._skipped_count += 1
+                    self._update_progress(advance=1)
+                elif status == ERROR:
+                    self._error_count += 1
+                    if self.batch_writes and error_payload is not None:
+                        self._queue_marker_write(key, error_payload)
+                    self._update_progress(advance=1)
+        finally:
+            self._flush_deferred_writes()
+
+    def _update_progress(self, advance: int = 0) -> None:
+        """Update Rich progress completion and status counters."""
+        if self._progress:
+            self._progress.update(
+                self._task_id,
+                advance=advance,
+                completed_count=self._completed_count,
+                error_count=self._error_count,
+                skipped_count=self._skipped_count,
+            )
+
+    def _queue_marker_write(self, key: str, error_payload: Optional[bytes]) -> None:
+        """Queue a success/error marker write or fall back to deferred writes."""
+        if self._batch_writer is not None:
+            self._batch_writer.enqueue(key, error_payload)
+        else:
+            self._deferred_writes.append((key, error_payload))
+
+    def _flush_deferred_writes(self) -> None:
+        """Flush queued/deferred success/error markers, if batch_writes is enabled."""
+        if self._batch_writer is not None:
+            writer = self._batch_writer
+            writer.close()
+            self._batch_writer = None
+
+        if not self._deferred_writes:
+            return
+
+        markers = self._deferred_writes
+        if self._env is not None:
+            _write_markers_with_dynamic_map(
+                self._env,
+                markers,
+                self.map_resize_threshold,
+                self.map_resize_factor,
+            )
+        else:
+            env = lmdb.open(
+                self.db_path, map_size=self.map_size, writemap=True, readonly=False
+            )
+            try:
+                _write_markers_with_dynamic_map(
+                    env,
+                    markers,
+                    self.map_resize_threshold,
+                    self.map_resize_factor,
+                )
+            finally:
+                env.close()
+        self._deferred_writes = []
 
     @property
     def completed(self) -> int:
@@ -535,28 +861,23 @@ class TrackedParallelIterator:
         """
         return self._skipped_count
 
-    def log_error(self, key: str, error: Exception) -> None:
+    def log_error(self, key: str) -> None:
         """
-        Log an error to the LMDB database with the given key.
+        Mark an item as errored in the LMDB database.
 
         This is useful for logging errors that occur outside the worker
-        (e.g., during post-processing).
+        (e.g., during post-processing). The stored value is always
+        ERROR_MARKER.
 
         Args:
-            key: The item key (without 'error:' prefix)
-            error: The exception that occurred
+            key: The item key
         """
-        error_data = {
-            "timestamp": datetime.now().isoformat(),
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-            "traceback": traceback.format_exc(),
-        }
+        self._flush_deferred_writes()
+
+        key_bytes = _key_bytes(key)
 
         def write_error(txn: lmdb.Transaction) -> None:
-            txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
-            # Clear any existing success marker
-            txn.delete(key.encode())
+            txn.put(key_bytes, ERROR_MARKER)
 
         # Use existing environment if available (multithreading mode)
         if self._env is not None:

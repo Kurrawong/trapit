@@ -1,192 +1,419 @@
 # trapit
 
-Tracked Reprocessable Async/Parallel Iterator - parallel processing with LMDB tracking.
+`trapit` is a **Tracked Reprocessable Async/Parallel Iterator** for Python. It applies a function to an iterable, optionally in parallel, while recording per-item success/error markers in an LMDB database so future runs can skip completed work or retry failed work.
+
+It is useful for long-running batch jobs, crawlers, data pipelines, ETL tasks, enrichment jobs, and any workload where you want resumable processing with lightweight persistent state.
+
+## Features
+
+- **Persistent item tracking** with LMDB.
+- **Resume support**: skip previously successful or failed items by default.
+- **Retry failed items** with `repro="errors"`.
+- **Force full reprocessing** with `repro="all"`.
+- **Custom reprocessing decisions** with `Callable[[item], bool]`.
+- **Three processing modes**:
+  - `"multiprocessing"`
+  - `"multithreading"`
+  - `"singlethreaded"`
+- **Unordered or ordered parallel result yielding** via `preserve_order`.
+- **Worker timeout handling** for multiprocessing.
+- **Status overwrite** when an item changes from error to success or success to error.
+- **Rich progress bar** with ETA, enabled automatically in a TTY.
+- **Processing counters** for completed, errored, and skipped items.
+
+## Requirements
+
+- Python `>=3.12`
+- `lmdb`
+- `rich`
 
 ## Installation
 
-From GitHub (latest):
+From GitHub:
 
 ```bash
 pip install git+https://github.com/kurrawong/trapit.git
 ```
 
-From GitHub (specific version/tag):
+Install a specific tag or revision:
 
 ```bash
-uv pip install git+https://github.com/kurrawong/trapit.git@v0.0.1
+pip install git+https://github.com/kurrawong/trapit.git@v0.1.3
 ```
 
-## Usage
+## Quick start
 
 ```python
 from trapit import TrackedParallelIterator
 
+
 def process_item(item: int) -> int:
     if item == 3:
-        raise ValueError(f"Error on item {item}")
+        raise ValueError("example failure")
     return item * 2
 
-def get_key(item: int) -> str:
-    return f"item_{item}"
 
 items = [1, 2, 3, 4, 5]
 
-# Process items with tracking. If db_path is omitted, ".trapit" is used.
-# If key_func is omitted, str(item) is used.
 with TrackedParallelIterator(
-    items,
-    process_item,
-    get_key,
-    "./tracker_db",
+    iterable=items,
+    func=process_item,
     mode="multithreading",
     workers=4,
 ) as pit:
-    for item, item_key, result in pit:
-        print(f"Processed {item_key}: {result}")
+    for item, key, result in pit:
+        print(item, key, result)
 
-    # Get processing statistics
-    print(f"Completed: {pit.completed}")  # Number of successfully processed items
-    print(f"Errors: {pit.errors}")        # Number of items that failed
-    print(f"Skipped: {pit.skipped}")      # Number of items that were skipped
+print("completed", pit.completed)
+print("errors", pit.errors)
+print("skipped", pit.skipped)
+```
 
-# Log errors that occur outside the worker
-try:
-    do_something_with(result)
-except Exception as e:
-    pit.log_error(item_key, e)
+Iteration yields only successful results as:
 
-# Pass additional arguments to your processing function
-def process_with_config(item: int, multiplier: int, offset: int = 0) -> int:
-    return (item * multiplier) + offset
+```python
+(item, key, result)
+```
 
+Skipped and errored items are not yielded, but they are counted on the iterator.
+
+## Core API
+
+```python
+TrackedParallelIterator(
+    iterable,
+    func,
+    key_func=None,
+    db_path=".trapit",
+    mode="multiprocessing",
+    workers=None,
+    chunksize=1,
+    map_size=1024 * 1024 * 1024,
+    map_resize_threshold=0.8,
+    map_resize_factor=2.0,
+    preserve_order=False,
+    worker_timeout=300,
+    repro="none",
+    func_args=None,
+    func_kwargs=None,
+    show_progress=None,
+    batch_writes=True,
+    write_batch_size=1000,
+    write_flush_interval=0.5,
+)
+```
+
+### Important parameters
+
+| Parameter        | Default                   | Description                                                                           |
+| ---------------- | ------------------------- | ------------------------------------------------------------------------------------- |
+| `iterable`       | required                  | Items to process.                                                                     |
+| `func`           | required                  | Callable applied to each item. Receives `item`, then `func_args`, then `func_kwargs`. |
+| `key_func`       | `str`                     | Callable that returns a **string** key for each item.                                 |
+| `db_path`        | `.trapit`                 | LMDB database directory used for tracking.                                            |
+| `mode`           | `multiprocessing`         | One of `multiprocessing`, `multithreading`, or `singlethreaded`.                      |
+| `workers`        | `max(1, cpu_count() - 1)` | Number of process/thread workers.                                                     |
+| `chunksize`      | `1`                       | Multiprocessing chunk size. Must be `1` when `worker_timeout` is not `None`.          |
+| `preserve_order` | `False`                   | Yield parallel results in input order when `True`.                                    |
+| `worker_timeout` | `300`                     | Multiprocessing timeout in seconds for the next result. Use `None` to disable.        |
+| `repro`          | `none`                    | Reprocessing mode. See below.                                                         |
+| `show_progress`  | `None`                    | `None` auto-enables progress only when `sys.stdout.isatty()` is true.                 |
+| `batch_writes`   | `True`                    | Defer marker writes to a queued writer thread.                                        |
+
+## Tracking model
+
+For each item, `key_func(item)` must return a `str`.
+
+`trapit` stores compact LMDB markers:
+
+- success marker: `key -> b"0"`
+- error marker: `key -> b"1"`
+
+Each item stores a single marker value at its key; later success/error updates overwrite the previous marker.
+
+Exception details are logged with `logging.exception`, but only a compact error marker is stored in LMDB.
+
+## Reprocessing modes
+
+The `repro` parameter controls whether an item should be processed.
+
+| Mode       | Behavior                                                                                                                                                                        |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"none"`   | Default. Skip items that already have either a success marker or an error marker.                                                                                               |
+| `"errors"` | Process only items that currently have an error marker.                                                                                                                         |
+| `"all"`    | Process every item, ignoring existing tracker state.                                                                                                                            |
+| callable   | Call `repro(item)`. Process the item only if it returns `True`. Existing LMDB state is ignored for the decision, but new success/error state is still written after processing. |
+
+Retry only failed items:
+
+```python
 with TrackedParallelIterator(
     items,
-    process_with_config,
-    get_key,
-    "./tracker_db",
-    mode="multiprocessing",
-    preserve_order=True,         # Optional: enforce input order
-    worker_timeout=300,          # Kill stalled workers after 300s; default is 300s
-    func_args=(3,),              # Pass multiplier=3 as positional arg
-    func_kwargs={"offset": 10},  # Pass offset=10 as keyword arg
+    process_item,
+    key_func=item_key,
+    repro="errors",
 ) as pit:
-    for item, item_key, result in pit:
-        print(f"Processed {item_key}: {result}")
+    for item, key, result in pit:
+        print(key, result)
 ```
 
-## Reprocessing Modes
-
-The `repro` parameter controls how items are reprocessed:
-
-- **`"none"`** (default): Skip items that were already processed (success or error)
-- **`"errors"`**: Only reprocess items that previously failed
-- **`"all"`**: Process all items, ignoring existing state
-- **`Callable[[T], bool]`**: A custom function that takes an item and returns `True` if it should be processed. When using a callable, the LMDB tracker is **ignored** for determining whether to process, but is still used to mark items as processed or in error after processing.
+Reprocess everything:
 
 ```python
-# Retry only failed items
-with TrackedParallelIterator(..., repro="errors") as pit:
-    for item_key, result in pit:
-        ...
+with TrackedParallelIterator(
+    items,
+    process_item,
+    key_func=item_key,
+    repro="all",
+) as pit:
+    list(pit)
+```
 
-# Reprocess everything from scratch
-with TrackedParallelIterator(..., repro="all") as pit:
-    for item_key, result in pit:
-        ...
+Use a custom decision function:
 
-# Use a custom function to decide per-item
-def should_reprocess(item: dict) -> bool:
-    # Only reprocess high-priority items
+```python
+def should_process(item: dict) -> bool:
     return item.get("priority") == "high"
 
-with TrackedParallelIterator(..., repro=should_reprocess) as pit:
-    for item_key, result in pit:
+
+with TrackedParallelIterator(
+    records,
+    process_record,
+    key_func=lambda record: record["id"],
+    repro=should_process,
+) as pit:
+    for record, key, result in pit:
         ...
 ```
 
-## Features
+## Processing modes
 
-- **Processing Modes**: Supports multiprocessing, multithreading, and singlethreaded modes
-- **Persistent Tracking**: Uses LMDB for fast, reliable tracking of processed items
-- **Error Tracking**: Errors are logged with timestamps, error types, messages, and tracebacks
-- **Resumable**: Can resume processing from where it left off
-- **Status Cleanup**: When an item's status changes (error → success or vice versa), old markers are automatically cleaned up
-- **Processing Statistics**: Track completed, errored, and skipped item counts with `completed`, `errors`, and `skipped` properties
-- **3-tuple Yield**: Iteration now yields `(item, key, result)` for each successfully processed item
-- **Rich Progress Bar**: Built-in progress bar with ETA, displayed when running in a TTY
-- **Function Arguments**: Pass additional arguments to your processing function with `func_args` and `func_kwargs`
-- **Default Tracking Path and Keys**: `db_path` defaults to `.trapit`, and `key_func` defaults to `str(item)`
-- **Per-worker LMDB Environments**: In multiprocessing mode, each worker process opens LMDB once and closes it when the process exits
-- **Responsive Multiprocessing Progress**: Multiprocessing is unordered by default so progress updates as workers complete; set `preserve_order=True` to yield in input order
-- **Worker Timeout**: Set `worker_timeout` in multiprocessing mode to terminate the worker pool if no result arrives within the timeout
-- **Dynamic LMDB Map Resizing**: The tracking database automatically grows when it gets close to the configured `map_size` limit. Tune with `map_resize_threshold` and `map_resize_factor`.
+### Single-threaded
 
-## Processing Modes
-
-Use `mode="singlethreaded"` to process items sequentially while still using the same LMDB tracking, repro, error, and progress behavior:
+Useful for debugging, deterministic local runs, or functions that should not run concurrently.
 
 ```python
-with TrackedParallelIterator(..., mode="singlethreaded") as pit:
+with TrackedParallelIterator(
+    items,
+    process_item,
+    mode="singlethreaded",
+) as pit:
+    for item, key, result in pit:
+        ...
+```
+
+### Multithreading
+
+Useful for I/O-bound work.
+
+```python
+with TrackedParallelIterator(
+    items,
+    process_item,
+    mode="multithreading",
+) as pit:
+    for item, key, result in pit:
+        ...
+```
+
+### Multiprocessing
+
+Useful for CPU-bound work.
+
+```python
+with TrackedParallelIterator(
+    items,
+    process_item,
+    mode="multiprocessing",
+) as pit:
+    for item, key, result in pit:
+        ...
+```
+
+For multiprocessing, functions and items must be pickle-compatible on platforms that use process spawning.
+
+## Result ordering
+
+Parallel modes yield completed work as soon as it is available by default:
+
+```python
+with TrackedParallelIterator(items, process_item, preserve_order=False) as pit:
+    ...  # results may be out of input order
+```
+
+Set `preserve_order=True` to yield successful results in input order:
+
+```python
+with TrackedParallelIterator(items, process_item, preserve_order=True) as pit:
     ...
 ```
 
-## Multiprocessing Ordering and Timeouts
+## Multiprocessing timeouts
 
-Multiprocessing mode uses unordered results by default for better progress reporting, especially on Windows:
-
-```python
-with TrackedParallelIterator(..., mode="multiprocessing") as pit:
-    ...  # results may be yielded out of input order
-```
-
-To enforce input ordering:
+When `mode="multiprocessing"` and `worker_timeout` is not `None`, `trapit` waits at most that many
+seconds for the next worker result. If the timeout expires, the pool is terminated and a
+built-in `TimeoutError` is raised.
 
 ```python
-with TrackedParallelIterator(..., mode="multiprocessing", preserve_order=True) as pit:
-    ...
+with TrackedParallelIterator(
+    items,
+    process_item,
+    mode="multiprocessing",
+    worker_timeout=60,
+) as pit:
+    list(pit)
 ```
 
-To terminate stalled workers, set `worker_timeout` to the maximum number of seconds to wait for the next result. It defaults to 300 seconds. This requires `chunksize=1`; set `worker_timeout=None` to disable timeout handling:
+`worker_timeout` requires `chunksize=1`. Disable timeout handling with:
 
 ```python
-with TrackedParallelIterator(..., mode="multiprocessing", worker_timeout=300) as pit:
-    ...
+TrackedParallelIterator(..., worker_timeout=None)
 ```
 
-## Progress Bar
+## Passing extra function arguments
 
-By default, a Rich progress bar is displayed when running in a terminal (TTY). You can control this behavior with the `show_progress` parameter:
+`func_args` and `func_kwargs` are passed to `func` after the item.
 
 ```python
-# Show progress bar (default when in TTY)
-with TrackedParallelIterator(..., show_progress=True) as pit:
-    ...
+def process_with_config(item: int, multiplier: int, offset: int = 0) -> int:
+    return item * multiplier + offset
 
-# Hide progress bar
-with TrackedParallelIterator(..., show_progress=False) as pit:
-    ...
 
-# Auto-detect based on TTY (default behavior)
-with TrackedParallelIterator(...) as pit:
-    ...
+with TrackedParallelIterator(
+    [1, 2, 3],
+    process_with_config,
+    func_args=(10,),
+    func_kwargs={"offset": 5},
+    mode="singlethreaded",
+) as pit:
+    assert list(pit) == [(1, "1", 15), (2, "2", 25), (3, "3", 35)]
 ```
 
-The progress bar shows:
+`func_args` normalization:
 
-- A visual progress bar
-- Task description
-- Completed/total count
-- Estimated time remaining
+- `None` becomes `()`
+- non-iterable scalars become `(value,)`
+- strings and bytes are treated as scalar values
+- other iterables become `tuple(value)`
+
+## Progress bar
+
+By default, progress is shown only when stdout is a TTY:
+
+```python
+TrackedParallelIterator(..., show_progress=None)
+```
+
+Force it on or off:
+
+```python
+TrackedParallelIterator(..., show_progress=True)
+TrackedParallelIterator(..., show_progress=False)
+```
+
+The progress bar includes a bar, description, completed/total count, status counts
+(`completed`, `errors`, `skipped`), and estimated time remaining.
+If the iterable has no length, the total is unknown.
+
+## Batch writes
+
+By default, workers return marker updates to the main iterator, where a queued writer thread
+batches them into fewer LMDB transactions. Set `batch_writes=False` to make each worker write
+its own success/error marker immediately.
+
+```python
+with TrackedParallelIterator(
+    items,
+    process_item,
+    mode="multiprocessing",
+    batch_writes=True,
+    write_batch_size=1000,
+    write_flush_interval=0.5,
+) as pit:
+    for item, key, result in pit:
+        ...
+```
+
+Pending writes are flushed when iteration exits, including early exits from the context manager.
+
+## Dynamic LMDB map resizing
+
+LMDB requires a configured map size. `trapit` starts with `map_size` and grows the map when
+usage approaches `map_resize_threshold` or when LMDB raises `MapFullError`.
+
+```python
+TrackedParallelIterator(
+    items,
+    process_item,
+    map_size=64 * 1024 * 1024,
+    map_resize_threshold=0.8,
+    map_resize_factor=2.0,
+)
+```
+
+`map_resize_threshold` must be between `0` and `1`, and `map_resize_factor` must be greater than `1`.
+
+## Logging external errors
+
+Use `log_error(key)` to mark an item as errored outside the worker function, for example during downstream post-processing.
+
+```python
+with TrackedParallelIterator(
+    items,
+    process_item,
+) as pit:
+    try:
+        for item, key, result in pit:
+            post_process(result)
+    except Exception:
+        pit.log_error(key)
+```
+
+`log_error` writes `key -> ERROR_MARKER`, overwriting any existing success marker for `key`.
+
+## Counters
+
+Inside the context manager, the following read-only properties are updated during iteration:
+
+```python
+pit.completed  # successful items yielded
+pit.errors     # items whose worker function raised
+pit.skipped    # items skipped by repro/tracker state
+```
+
+Counters are reset when entering the context manager.
+
+## Caveats
+
+- `TrackedParallelIterator` must be used as a context manager.
+- The same instance cannot be re-entered while already active.
+- `key_func` must return `str`; other return types raise `TypeError`.
+- Worker exceptions are swallowed by the iterator, logged, counted, and marked as errors. They are not yielded.
+- Multiprocessing requires pickle-compatible functions, arguments, and items on spawn-based platforms.
+- `worker_timeout` applies only to multiprocessing result retrieval.
 
 ## Development
 
+Install dependencies with `uv`:
+
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
+uv sync
+```
 
-# Run tests
-pytest
+Run tests:
 
-# Run type checking
-mypy tarpit
+```bash
+uv run pytest
+```
+
+Run linting:
+
+```bash
+uv run ruff check .
+```
+
+Run type checking:
+
+```bash
+uv run mypy trapit
 ```
