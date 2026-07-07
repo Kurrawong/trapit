@@ -962,6 +962,33 @@ class TestFuncArgsKwargs:
         assert pit.completed == 3
 
 
+class TestDynamicMapResize:
+    """Test automatic LMDB map resizing."""
+
+    def test_map_resizes_when_close_to_limit(self, db_path):
+        """A small initial map grows instead of failing with MapFullError."""
+        items = list(range(200))
+
+        def large_key(item: int) -> str:
+            return f"item_{item}_" + ("x" * 300)
+
+        with TrackedParallelIterator(
+            items,
+            process_item_success,
+            large_key,
+            db_path,
+            mode="singlethreaded",
+            map_size=64 * 1024,
+            map_resize_threshold=0.5,
+            map_resize_factor=2,
+        ) as pit:
+            results = list(pit)
+            resized_map_size = pit._env.info()["map_size"]
+
+        assert len(results) == len(items)
+        assert resized_map_size > 64 * 1024
+
+
 class TestInvalidInputs:
     """Test error handling for invalid inputs."""
 
@@ -974,6 +1001,28 @@ class TestInvalidInputs:
                 get_key,
                 "./test_db",
                 repro="invalid",
+            )
+
+    def test_invalid_map_resize_threshold(self, db_path):
+        """Test that invalid map_resize_threshold raises ValueError."""
+        with pytest.raises(ValueError, match="map_resize_threshold"):
+            TrackedParallelIterator(
+                [1, 2, 3],
+                process_item_success,
+                get_key,
+                db_path,
+                map_resize_threshold=1,
+            )
+
+    def test_invalid_map_resize_factor(self, db_path):
+        """Test that invalid map_resize_factor raises ValueError."""
+        with pytest.raises(ValueError, match="map_resize_factor"):
+            TrackedParallelIterator(
+                [1, 2, 3],
+                process_item_success,
+                get_key,
+                db_path,
+                map_resize_factor=1,
             )
 
     def test_invalid_mode(self, db_path):

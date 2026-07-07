@@ -7,6 +7,7 @@ Extended to include a Rich progress bar with ETA, only displayed if running in a
 import logging
 import pickle
 import sys
+import threading
 import traceback
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,61 @@ COMPLETED = "__COMPLETED__"
 # handles on Windows.
 _WORKER_ENV: Optional[lmdb.Environment] = None
 _WORKER_ENV_FINALIZER: Optional[multiprocessing_util.Finalize] = None
+_MAP_RESIZE_LOCK = threading.RLock()
+
+
+def _lmdb_used_bytes(env: lmdb.Environment) -> tuple[int, int]:
+    """Return approximate used bytes and configured map size for an LMDB env."""
+    info = env.info()
+    stat = env.stat()
+    used_bytes = (info["last_pgno"] + 1) * stat["psize"]
+    return used_bytes, info["map_size"]
+
+
+def _grow_map_if_needed(
+    env: lmdb.Environment,
+    threshold: float,
+    resize_factor: float,
+    required_size: Optional[int] = None,
+) -> None:
+    """Grow an LMDB map when usage is close to or beyond the current map size."""
+    with _MAP_RESIZE_LOCK:
+        used_bytes, map_size = _lmdb_used_bytes(env)
+        target_size = required_size if required_size is not None else map_size
+        if used_bytes < map_size * threshold and target_size <= map_size:
+            return
+
+        new_size = max(
+            int(map_size * resize_factor),
+            int(used_bytes * resize_factor),
+            int(target_size * resize_factor),
+            map_size + 1,
+        )
+        env.set_mapsize(new_size)
+        logging.info("Increased LMDB map size from %s to %s bytes", map_size, new_size)
+
+
+def _write_with_dynamic_map(
+    env: lmdb.Environment,
+    write_func: Callable[[lmdb.Transaction], None],
+    threshold: float,
+    resize_factor: float,
+) -> None:
+    """Run a write transaction, growing the map preemptively and on MapFullError."""
+    _grow_map_if_needed(env, threshold, resize_factor)
+    while True:
+        try:
+            with env.begin(write=True) as txn:
+                write_func(txn)
+            return
+        except lmdb.MapFullError:
+            used_bytes, map_size = _lmdb_used_bytes(env)
+            _grow_map_if_needed(
+                env,
+                threshold=0,
+                resize_factor=resize_factor,
+                required_size=max(map_size + 1, used_bytes + 1),
+            )
 
 
 def _close_worker_env() -> None:
@@ -78,6 +134,8 @@ def _worker_process_item(
     repro: ReproType = "none",
     func_args: tuple = (),
     func_kwargs: dict = dict(),
+    map_resize_threshold: float = 0.8,
+    map_resize_factor: float = 2.0,
 ) -> tuple[str, T, str, R | None | Exception]:
     """
     Process an item and return a tuple with status information.
@@ -129,10 +187,15 @@ def _worker_process_item(
 
     try:
         result = func(item, *func_args, **func_kwargs)
-        with env.begin(write=True) as txn:
+
+        def write_success(txn: lmdb.Transaction) -> None:
             txn.put(key.encode(), b"1")
             # Clear any existing error marker for this key
             txn.delete(f"error:{key}".encode())
+
+        _write_with_dynamic_map(
+            env, write_success, map_resize_threshold, map_resize_factor
+        )
         return (COMPLETED, item, key, result)
     except Exception as e:
         error_data = {
@@ -141,10 +204,12 @@ def _worker_process_item(
             "error_message": str(e),
             "traceback": traceback.format_exc(),
         }
-        with env.begin(write=True) as txn:
+        def write_error(txn: lmdb.Transaction) -> None:
             txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
             # Clear any existing success marker for this key
             txn.delete(key.encode())
+
+        _write_with_dynamic_map(env, write_error, map_resize_threshold, map_resize_factor)
         logging.error(e)
         return (ERROR, item, key, e)
 
@@ -165,7 +230,10 @@ class TrackedParallelIterator:
         mode: 'multiprocessing', 'multithreading', or 'singlethreaded'
         workers: Number of parallel workers. Defaults to cpu_count - 1
         chunksize: For multiprocessing, number of items per chunk
-        map_size: LMDB map size in bytes
+        map_size: Initial LMDB map size in bytes
+        map_resize_threshold: Grow the LMDB map when approximate usage reaches
+            this fraction of the current map size. Defaults to 0.8.
+        map_resize_factor: Multiplier used when growing the LMDB map. Defaults to 2.0.
         preserve_order: For multiprocessing, yield results in input order. Defaults to
             False so progress can update as workers complete, especially on Windows.
         worker_timeout: For multiprocessing, maximum seconds to wait for the next
@@ -202,6 +270,8 @@ class TrackedParallelIterator:
         workers: Optional[int] = None,
         chunksize: int = 1,
         map_size: int = 1024 * 1024 * 1024,
+        map_resize_threshold: float = 0.8,
+        map_resize_factor: float = 2.0,
         preserve_order: bool = False,
         worker_timeout: Optional[float] = 5,
         repro: ReproType = "none",
@@ -223,6 +293,10 @@ class TrackedParallelIterator:
             )
         if worker_timeout is not None and chunksize != 1:
             raise ValueError("worker_timeout requires chunksize=1")
+        if not 0 < map_resize_threshold < 1:
+            raise ValueError("map_resize_threshold must be between 0 and 1")
+        if map_resize_factor <= 1:
+            raise ValueError("map_resize_factor must be greater than 1")
         self.iterable = iterable
         self.func = func
         self.key_func = key_func
@@ -231,6 +305,8 @@ class TrackedParallelIterator:
         self.workers = workers
         self.chunksize = chunksize
         self.map_size = map_size
+        self.map_resize_threshold = map_resize_threshold
+        self.map_resize_factor = map_resize_factor
         self.preserve_order = preserve_order
         self.worker_timeout = worker_timeout
         self.repro = repro
@@ -306,6 +382,8 @@ class TrackedParallelIterator:
                 repro=self.repro,
                 func_args=self.func_args,
                 func_kwargs=self.func_kwargs,
+                map_resize_threshold=self.map_resize_threshold,
+                map_resize_factor=self.map_resize_factor,
             )
             map_method = (
                 self._pool.imap if self.preserve_order else self._pool.imap_unordered
@@ -325,6 +403,8 @@ class TrackedParallelIterator:
                 repro=self.repro,
                 func_args=self.func_args,
                 func_kwargs=self.func_kwargs,
+                map_resize_threshold=self.map_resize_threshold,
+                map_resize_factor=self.map_resize_factor,
             )
             if self.mode == "multithreading":
                 self._executor = ThreadPoolExecutor(max_workers=self.workers)
@@ -442,21 +522,30 @@ class TrackedParallelIterator:
             "traceback": traceback.format_exc(),
         }
 
+        def write_error(txn: lmdb.Transaction) -> None:
+            txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
+            # Clear any existing success marker
+            txn.delete(key.encode())
+
         # Use existing environment if available (multithreading mode)
         if self._env is not None:
-            with self._env.begin(write=True) as txn:
-                txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
-                # Clear any existing success marker
-                txn.delete(key.encode())
+            _write_with_dynamic_map(
+                self._env,
+                write_error,
+                self.map_resize_threshold,
+                self.map_resize_factor,
+            )
         else:
             # Open a new environment for multiprocessing mode or external usage
             env = lmdb.open(
                 self.db_path, map_size=self.map_size, writemap=True, readonly=False
             )
             try:
-                with env.begin(write=True) as txn:
-                    txn.put(f"error:{key}".encode(), pickle.dumps(error_data))
-                    # Clear any existing success marker
-                    txn.delete(key.encode())
+                _write_with_dynamic_map(
+                    env,
+                    write_error,
+                    self.map_resize_threshold,
+                    self.map_resize_factor,
+                )
             finally:
                 env.close()

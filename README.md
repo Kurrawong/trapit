@@ -119,6 +119,7 @@ with TrackedParallelIterator(..., repro=should_reprocess) as pit:
 - **Per-worker LMDB Environments**: In multiprocessing mode, each worker process opens LMDB once and closes it when the process exits
 - **Responsive Multiprocessing Progress**: Multiprocessing is unordered by default so progress updates as workers complete; set `preserve_order=True` to yield in input order
 - **Worker Timeout**: Set `worker_timeout` in multiprocessing mode to terminate the worker pool if no result arrives within the timeout
+- **Dynamic LMDB Map Resizing**: The tracking database automatically grows when it gets close to the configured `map_size` limit. Tune with `map_resize_threshold` and `map_resize_factor`.
 
 ## Processing Modes
 
