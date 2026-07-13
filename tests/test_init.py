@@ -1,3 +1,4 @@
+import logging
 import time
 
 import lmdb
@@ -97,14 +98,20 @@ def test_func_args_are_normalized(tmp_path):
 
 
 def test_iterator_must_be_context_managed():
-    pit = TrackedParallelIterator([1], double, mode="singlethreaded", show_progress=False)
+    pit = TrackedParallelIterator(
+        [1], double, mode="singlethreaded", show_progress=False
+    )
     with pytest.raises(RuntimeError, match="context manager"):
         list(pit)
 
 
 def test_context_cannot_be_reentered(tmp_path):
     pit = TrackedParallelIterator(
-        [1], double, db_path=str(tmp_path / "db"), mode="singlethreaded", show_progress=False
+        [1],
+        double,
+        db_path=str(tmp_path / "db"),
+        mode="singlethreaded",
+        show_progress=False,
     )
     with pit:
         with pytest.raises(RuntimeError, match="re-entered"):
@@ -147,8 +154,9 @@ def test_func_args_and_kwargs_are_passed(tmp_path):
     assert counts == (2, 0, 0)
 
 
-def test_worker_errors_are_counted_not_yielded_and_persisted(tmp_path):
-    results, counts, db_path = run_iterator(tmp_path, [1, 3, 4], fail_on_three)
+def test_worker_errors_are_counted_not_yielded_and_persisted(tmp_path, caplog):
+    with caplog.at_level(logging.ERROR, logger="trapit"):
+        results, counts, db_path = run_iterator(tmp_path, [1, 3, 4], fail_on_three)
 
     assert results == [(1, "item-1", 10), (4, "item-4", 40)]
     assert counts == (2, 1, 0)
@@ -156,6 +164,11 @@ def test_worker_errors_are_counted_not_yielded_and_persisted(tmp_path):
     assert state["item-1"] == SUCCESS_MARKER
     assert state["item-3"] == ERROR_MARKER
     assert state["item-4"] == SUCCESS_MARKER
+    assert any(
+        record.name == "trapit"
+        and record.getMessage() == "Error processing key 'item-3'"
+        for record in caplog.records
+    )
 
 
 def test_repro_none_skips_success_and_error_records(tmp_path):
@@ -230,7 +243,12 @@ def test_log_error_marks_error_and_clears_success(tmp_path):
     _, _, db_path = run_iterator(tmp_path, [1])
 
     pit = TrackedParallelIterator(
-        [], double, key_func=key, db_path=str(db_path), mode="singlethreaded", show_progress=False
+        [],
+        double,
+        key_func=key,
+        db_path=str(db_path),
+        mode="singlethreaded",
+        show_progress=False,
     )
     pit.log_error("item-1")
 

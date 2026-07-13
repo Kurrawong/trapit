@@ -131,7 +131,7 @@ For each item, `key_func(item)` must return a `str`.
 
 Each item stores a single marker value at its key; later success/error updates overwrite the previous marker.
 
-Exception details are logged with `logging.exception`, but only a compact error marker is stored in LMDB.
+Exception details are logged through the named `trapit` logger, but only a compact error marker is stored in LMDB.
 
 ## Reprocessing modes
 

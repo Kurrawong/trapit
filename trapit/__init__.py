@@ -20,6 +20,8 @@ from typing import Callable, Hashable, Optional, TypeVar, Union
 import lmdb
 from rich.progress import BarColumn, Console, Progress, TextColumn, TimeRemainingColumn
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
 R = TypeVar("R")
 K = TypeVar("K", bound=Hashable)
@@ -70,7 +72,7 @@ def _grow_map_if_needed(
             map_size + 1,
         )
         env.set_mapsize(new_size)
-        logging.info("Increased LMDB map size from %s to %s bytes", map_size, new_size)
+        logger.info("Increased LMDB map size from %s to %s bytes", map_size, new_size)
 
 
 def _write_with_dynamic_map(
@@ -381,7 +383,7 @@ def _worker_process_item(
                 has_error = marker == ERROR_MARKER
         except lmdb.Error as exc:
             # If we can't read from the database, proceed with processing.
-            logging.warning("Failed to read tracker state for key %r: %s", key, exc)
+            logger.warning("Failed to read tracker state for key %r: %s", key, exc)
         else:
             if repro == "none":
                 # Skip if already processed (success or error)
@@ -421,7 +423,7 @@ def _worker_process_item(
             _write_with_dynamic_map(
                 env, write_error, map_resize_threshold, map_resize_factor
             )
-        logging.exception("Error processing key %r", key)
+        logger.exception("Error processing key %r", key)
         return (ERROR, item, key, e, error_payload)
 
 
@@ -760,7 +762,7 @@ class TrackedParallelIterator:
                     ) from exc
 
                 if result is None:
-                    logging.warning("Worker returned None; skipping result")
+                    logger.warning("Worker returned None; skipping result")
                     continue
                 status, item, key, data, error_payload = result
                 if status == COMPLETED:
