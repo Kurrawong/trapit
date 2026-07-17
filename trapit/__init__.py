@@ -391,6 +391,7 @@ def _worker_process_item(
     map_resize_threshold: float = 0.8,
     map_resize_factor: float = 2.0,
     defer_writes: bool = False,
+    persistent_tracking: bool = True,
 ) -> tuple[str, T, str, R | None | Exception, Optional[bytes]]:
     """
     Process an item and return a tuple with status information.
@@ -399,9 +400,10 @@ def _worker_process_item(
         (status, item, key, result_or_error)
         where status is one of: COMPLETED, SKIPPED, ERROR
     """
-    # Determine which environment to use.  Multithreading passes a shared env;
+    # Determine which environment to use. Multithreading passes a shared env;
     # multiprocessing workers use a per-process global initialized by the pool.
-    if env is None:
+    # No environment is opened when persistent tracking is disabled.
+    if persistent_tracking and env is None:
         assert db_path is not None
         assert map_size is not None
         env = _get_worker_env(db_path, map_size)
@@ -412,14 +414,14 @@ def _worker_process_item(
     key = key_func(item)
     key_bytes = _key_bytes(key)
 
-    # Check if repro is a callable - if so, use it to determine processing
-    # The LMDB tracker is ignored for the decision, but still used for marking
+    # Callable reprocessing still acts as an item filter without persistence.
     if callable(repro):
         should_process = repro(item)
         if not should_process:
             return (SKIPPED, item, key, None, None)
-    else:
+    elif persistent_tracking:
         # repro is a string mode
+        assert env is not None
         try:
             with env.begin() as txn:
                 marker = txn.get(key_bytes)
@@ -448,7 +450,8 @@ def _worker_process_item(
     try:
         result = func(item, *func_args, **func_kwargs)
 
-        if not defer_writes:
+        if persistent_tracking and not defer_writes:
+            assert env is not None
 
             def write_success(txn: lmdb.Transaction) -> None:
                 txn.put(key_bytes, SUCCESS_MARKER)
@@ -458,11 +461,12 @@ def _worker_process_item(
             )
         return (COMPLETED, item, key, result, None)
     except Exception as e:
-        error_payload = ERROR_MARKER
-        if not defer_writes:
+        error_payload = ERROR_MARKER if persistent_tracking else None
+        if persistent_tracking and not defer_writes:
+            assert env is not None
 
             def write_error(txn: lmdb.Transaction) -> None:
-                txn.put(key_bytes, error_payload)
+                txn.put(key_bytes, ERROR_MARKER)
 
             _write_with_dynamic_map(
                 env, write_error, map_resize_threshold, map_resize_factor
@@ -515,6 +519,8 @@ class TrackedParallelIterator:
             when batch_writes=True.
         write_flush_interval: Maximum seconds to keep a partial write batch in
             memory before flushing it when batch_writes=True.
+        persistent_tracking: Whether to read and write persistent LMDB state.
+            Disable this to avoid all database I/O when reprocessing is not needed.
 
     Yields:
         tuple: (item, key, result) for each successfully processed item.
@@ -546,6 +552,7 @@ class TrackedParallelIterator:
         batch_writes: bool | object = _UNSET,
         write_batch_size: int | object = _UNSET,
         write_flush_interval: float | object = _UNSET,
+        persistent_tracking: bool | object = _UNSET,
     ):
         # Explicit constructor arguments take precedence over environment values.
         db_path = _config_value("db_path", db_path, ".trapit", str)
@@ -579,6 +586,9 @@ class TrackedParallelIterator:
         )
         write_flush_interval = _config_value(
             "write_flush_interval", write_flush_interval, 0.5, float
+        )
+        persistent_tracking = _config_value(
+            "persistent_tracking", persistent_tracking, True, _parse_bool
         )
 
         if workers is None:
@@ -630,6 +640,7 @@ class TrackedParallelIterator:
         self.batch_writes = batch_writes
         self.write_batch_size = write_batch_size
         self.write_flush_interval = write_flush_interval
+        self.persistent_tracking = persistent_tracking
         # Normalize func_args to a tuple
         # Accept: None -> (), scalar -> (scalar,), iterable -> tuple(iterable)
         if func_args is None:
@@ -705,11 +716,14 @@ class TrackedParallelIterator:
             )
 
         if self.mode == "multiprocessing":
-            self._pool = Pool(
-                self.workers,
-                initializer=_init_worker_env,
-                initargs=(self.db_path, self.map_size),
-            )
+            if self.persistent_tracking:
+                self._pool = Pool(
+                    self.workers,
+                    initializer=_init_worker_env,
+                    initargs=(self.db_path, self.map_size),
+                )
+            else:
+                self._pool = Pool(self.workers)
             worker = partial(
                 _worker_process_item,
                 func=self.func,
@@ -722,17 +736,18 @@ class TrackedParallelIterator:
                 map_resize_threshold=self.map_resize_threshold,
                 map_resize_factor=self.map_resize_factor,
                 defer_writes=self.batch_writes,
+                persistent_tracking=self.persistent_tracking,
             )
             map_method = (
                 self._pool.imap if self.preserve_order else self._pool.imap_unordered
             )
             self._iterator = map_method(worker, self.iterable, chunksize=self.chunksize)
         elif self.mode in ("multithreading", "singlethreaded"):
-            # Open environment once for all threads, or once for the current
-            # process in singlethreaded mode.
-            self._env = lmdb.open(
-                self.db_path, map_size=self.map_size, writemap=True, readonly=False
-            )
+            # Open an environment once for tracked thread/single-process modes.
+            if self.persistent_tracking:
+                self._env = lmdb.open(
+                    self.db_path, map_size=self.map_size, writemap=True, readonly=False
+                )
             worker = partial(
                 _worker_process_item,
                 func=self.func,
@@ -744,6 +759,7 @@ class TrackedParallelIterator:
                 map_resize_threshold=self.map_resize_threshold,
                 map_resize_factor=self.map_resize_factor,
                 defer_writes=self.batch_writes,
+                persistent_tracking=self.persistent_tracking,
             )
             if self.mode == "multithreading":
                 self._executor = ThreadPoolExecutor(max_workers=self.workers)
@@ -758,7 +774,7 @@ class TrackedParallelIterator:
             else:
                 self._iterator = map(worker, self.iterable)
 
-        if self.batch_writes:
+        if self.persistent_tracking and self.batch_writes:
             self._batch_writer = _QueuedMarkerWriter(
                 db_path=self.db_path,
                 map_size=self.map_size,
@@ -845,7 +861,7 @@ class TrackedParallelIterator:
                 status, item, key, data, error_payload = result
                 if status == COMPLETED:
                     self._completed_count += 1
-                    if self.batch_writes:
+                    if self.persistent_tracking and self.batch_writes:
                         self._queue_marker_write(key, None)
                     self._update_progress(advance=1)
                     yield (item, key, data)
@@ -854,7 +870,11 @@ class TrackedParallelIterator:
                     self._update_progress(advance=1)
                 elif status == ERROR:
                     self._error_count += 1
-                    if self.batch_writes and error_payload is not None:
+                    if (
+                        self.persistent_tracking
+                        and self.batch_writes
+                        and error_payload is not None
+                    ):
                         self._queue_marker_write(key, error_payload)
                     self._update_progress(advance=1)
         finally:
@@ -952,6 +972,9 @@ class TrackedParallelIterator:
         Args:
             key: The item key
         """
+        if not self.persistent_tracking:
+            raise RuntimeError("log_error requires persistent_tracking=True")
+
         self._flush_deferred_writes()
 
         key_bytes = _key_bytes(key)

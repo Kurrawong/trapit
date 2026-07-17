@@ -100,6 +100,7 @@ TrackedParallelIterator(
     batch_writes=True,
     write_batch_size=1000,
     write_flush_interval=0.5,
+    persistent_tracking=True,
 )
 ```
 
@@ -116,7 +117,8 @@ Supported variables are `TRAPIT_DB_PATH`, `TRAPIT_MODE`, `TRAPIT_WORKERS`,
 `TRAPIT_CHUNKSIZE`, `TRAPIT_MAP_SIZE`, `TRAPIT_MAP_RESIZE_THRESHOLD`,
 `TRAPIT_MAP_RESIZE_FACTOR`, `TRAPIT_PRESERVE_ORDER`, `TRAPIT_WORKER_TIMEOUT`,
 `TRAPIT_REPRO`, `TRAPIT_SHOW_PROGRESS`, `TRAPIT_BATCH_WRITES`,
-`TRAPIT_WRITE_BATCH_SIZE`, and `TRAPIT_WRITE_FLUSH_INTERVAL`.
+`TRAPIT_WRITE_BATCH_SIZE`, `TRAPIT_WRITE_FLUSH_INTERVAL`, and
+`TRAPIT_PERSISTENT_TRACKING`.
 
 Boolean values accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
 Use `none` for `TRAPIT_WORKER_TIMEOUT` to disable the timeout and `auto` for
@@ -125,20 +127,41 @@ take precedence over environment variables.
 
 ### Important parameters
 
-| Parameter        | Default                   | Description                                                                           |
-| ---------------- | ------------------------- | ------------------------------------------------------------------------------------- |
-| `iterable`       | required                  | Items to process.                                                                     |
-| `func`           | required                  | Callable applied to each item. Receives `item`, then `func_args`, then `func_kwargs`. |
-| `key_func`       | `str`                     | Callable that returns a **string** key for each item.                                 |
-| `db_path`        | `.trapit`                 | LMDB database directory used for tracking.                                            |
-| `mode`           | `multiprocessing`         | One of `multiprocessing`, `multithreading`, or `singlethreaded`.                      |
-| `workers`        | `max(1, cpu_count() - 1)` | Number of process/thread workers.                                                     |
-| `chunksize`      | `1`                       | Multiprocessing chunk size. Must be `1` when `worker_timeout` is not `None`.          |
-| `preserve_order` | `False`                   | Yield parallel results in input order when `True`.                                    |
-| `worker_timeout` | `300`                     | Multiprocessing timeout in seconds for the next result. Use `None` to disable.        |
-| `repro`          | `none`                    | Reprocessing mode. See below.                                                         |
-| `show_progress`  | `None`                    | `None` auto-enables progress only when `sys.stdout.isatty()` is true.                 |
-| `batch_writes`   | `True`                    | Defer marker writes to a queued writer thread.                                        |
+| Parameter             | Default                   | Description                                                                           |
+| --------------------- | ------------------------- | ------------------------------------------------------------------------------------- |
+| `iterable`            | required                  | Items to process.                                                                     |
+| `func`                | required                  | Callable applied to each item. Receives `item`, then `func_args`, then `func_kwargs`. |
+| `key_func`            | `str`                     | Callable that returns a **string** key for each item.                                 |
+| `db_path`             | `.trapit`                 | LMDB database directory used for tracking.                                            |
+| `mode`                | `multiprocessing`         | One of `multiprocessing`, `multithreading`, or `singlethreaded`.                      |
+| `workers`             | `max(1, cpu_count() - 1)` | Number of process/thread workers.                                                     |
+| `chunksize`           | `1`                       | Multiprocessing chunk size. Must be `1` when `worker_timeout` is not `None`.          |
+| `preserve_order`      | `False`                   | Yield parallel results in input order when `True`.                                    |
+| `worker_timeout`      | `300`                     | Multiprocessing timeout in seconds for the next result. Use `None` to disable.        |
+| `repro`               | `none`                    | Reprocessing mode. See below.                                                         |
+| `show_progress`       | `None`                    | `None` auto-enables progress only when `sys.stdout.isatty()` is true.                 |
+| `batch_writes`        | `True`                    | Defer marker writes to a queued writer thread.                                        |
+| `persistent_tracking` | `True`                    | Read and write LMDB tracking state. Set to `False` to avoid database I/O.             |
+
+## Disabling persistent tracking
+
+When reprocessing is not needed, disable persistence to avoid opening LMDB and
+performing a database read and write for each item:
+
+```python
+with TrackedParallelIterator(
+    items,
+    process_item,
+    persistent_tracking=False,
+) as pit:
+    for item, key, result in pit:
+        ...
+```
+
+This can also be configured with `TRAPIT_PERSISTENT_TRACKING=false`. Items are
+still processed and completion/error counters still work, but no database is
+created, no markers are read or written, and string `repro` modes have no
+effect. A callable `repro` can still be used as an in-memory item filter.
 
 ## Tracking model
 

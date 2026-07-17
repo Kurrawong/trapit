@@ -105,6 +105,7 @@ def test_configuration_can_be_read_from_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("TRAPIT_BATCH_WRITES", "off")
     monkeypatch.setenv("TRAPIT_WRITE_BATCH_SIZE", "25")
     monkeypatch.setenv("TRAPIT_WRITE_FLUSH_INTERVAL", "1.25")
+    monkeypatch.setenv("TRAPIT_PERSISTENT_TRACKING", "false")
 
     pit = TrackedParallelIterator([], double)
 
@@ -122,6 +123,7 @@ def test_configuration_can_be_read_from_environment(monkeypatch, tmp_path):
     assert pit.batch_writes is False
     assert pit.write_batch_size == 25
     assert pit.write_flush_interval == 1.25
+    assert pit.persistent_tracking is False
 
 
 def test_explicit_configuration_overrides_environment(monkeypatch, tmp_path):
@@ -148,6 +150,52 @@ def test_func_args_are_normalized(tmp_path):
     assert TrackedParallelIterator([], double, func_args=3).func_args == (3,)
     assert TrackedParallelIterator([], double, func_args="x").func_args == ("x",)
     assert TrackedParallelIterator([], double, func_args=[1, 2]).func_args == (1, 2)
+
+
+def test_disabling_persistent_tracking_avoids_database_io(tmp_path):
+    db_path = tmp_path / "unused-db"
+
+    with TrackedParallelIterator(
+        [1, 1, 2],
+        double,
+        key_func=key,
+        db_path=str(db_path),
+        mode="singlethreaded",
+        persistent_tracking=False,
+        show_progress=False,
+    ) as pit:
+        assert list(pit) == [
+            (1, "item-1", 2),
+            (1, "item-1", 2),
+            (2, "item-2", 4),
+        ]
+        assert (pit.completed, pit.errors, pit.skipped) == (3, 0, 0)
+
+    assert not db_path.exists()
+
+
+def test_disabled_tracking_still_counts_errors_without_creating_db(tmp_path):
+    db_path = tmp_path / "unused-db"
+
+    with TrackedParallelIterator(
+        [3],
+        fail_on_three,
+        db_path=str(db_path),
+        mode="singlethreaded",
+        persistent_tracking=False,
+        show_progress=False,
+    ) as pit:
+        assert list(pit) == []
+        assert pit.errors == 1
+
+    assert not db_path.exists()
+
+
+def test_log_error_requires_persistent_tracking():
+    pit = TrackedParallelIterator([], double, persistent_tracking=False)
+
+    with pytest.raises(RuntimeError, match="persistent_tracking=True"):
+        pit.log_error("1")
 
 
 def test_iterator_must_be_context_managed():
