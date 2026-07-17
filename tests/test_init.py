@@ -40,6 +40,11 @@ def sleep_inverse(item):
     return item
 
 
+def sleep_long(item):
+    time.sleep(0.2)
+    return item
+
+
 def should_process_even(item):
     return item % 2 == 0
 
@@ -138,6 +143,17 @@ def test_explicit_configuration_overrides_environment(monkeypatch, tmp_path):
     assert pit.workers == 2
 
 
+def test_optional_environment_values_are_parsed(monkeypatch):
+    monkeypatch.setenv("TRAPIT_WORKER_TIMEOUT", "1.5")
+    monkeypatch.setenv("TRAPIT_SHOW_PROGRESS", "auto")
+    monkeypatch.setattr("trapit.sys.stdout.isatty", lambda: False)
+
+    pit = TrackedParallelIterator([], double)
+
+    assert pit.worker_timeout == 1.5
+    assert pit._show_progress is False
+
+
 def test_invalid_environment_configuration_has_clear_error(monkeypatch):
     monkeypatch.setenv("TRAPIT_BATCH_WRITES", "sometimes")
 
@@ -170,6 +186,54 @@ def test_disabling_persistent_tracking_avoids_database_io(tmp_path):
             (2, "item-2", 4),
         ]
         assert (pit.completed, pit.errors, pit.skipped) == (3, 0, 0)
+
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("mode", ["multithreading", "multiprocessing"])
+def test_disabled_tracking_avoids_database_in_parallel_modes(tmp_path, mode):
+    db_path = tmp_path / f"unused-{mode}"
+
+    with TrackedParallelIterator(
+        [1, 2],
+        double,
+        key_func=key,
+        db_path=str(db_path),
+        mode=mode,
+        workers=2,
+        persistent_tracking=False,
+        show_progress=False,
+    ) as pit:
+        assert sorted(pit) == [(1, "item-1", 2), (2, "item-2", 4)]
+
+    assert not db_path.exists()
+
+
+def test_disabled_tracking_ignores_string_repro_and_supports_callable_filter(tmp_path):
+    db_path = tmp_path / "unused-db"
+
+    with TrackedParallelIterator(
+        [1],
+        double,
+        db_path=str(db_path),
+        mode="singlethreaded",
+        repro="errors",
+        persistent_tracking=False,
+        show_progress=False,
+    ) as pit:
+        assert list(pit) == [(1, "1", 2)]
+
+    with TrackedParallelIterator(
+        [1, 2],
+        double,
+        db_path=str(db_path),
+        mode="singlethreaded",
+        repro=should_process_even,
+        persistent_tracking=False,
+        show_progress=False,
+    ) as pit:
+        assert list(pit) == [(2, "2", 4)]
+        assert pit.skipped == 1
 
     assert not db_path.exists()
 
@@ -356,6 +420,22 @@ def test_log_error_marks_error_and_clears_success(tmp_path):
     assert marker_state(db_path, ["item-1"])["item-1"] == ERROR_MARKER
 
 
+def test_immediate_writes_persist_success_and_error_markers(tmp_path):
+    results, counts, db_path = run_iterator(
+        tmp_path,
+        [1, 3],
+        fail_on_three,
+        batch_writes=False,
+    )
+
+    assert results == [(1, "item-1", 10)]
+    assert counts == (1, 1, 0)
+    assert marker_state(db_path, ["item-1", "item-3"]) == {
+        "item-1": SUCCESS_MARKER,
+        "item-3": ERROR_MARKER,
+    }
+
+
 def test_batch_writes_persist_success_and_error_markers(tmp_path):
     results, counts, db_path = run_iterator(
         tmp_path,
@@ -430,6 +510,24 @@ def test_multiprocessing_preserve_order(tmp_path):
     assert results == [(1, "item-1", 2), (2, "item-2", 4), (3, "item-3", 6)]
     assert counts == (3, 0, 0)
     assert marker_state(db_path, ["item-1"])["item-1"] == SUCCESS_MARKER
+
+
+def test_multiprocessing_worker_timeout_terminates_pool(tmp_path):
+    pit = TrackedParallelIterator(
+        [1],
+        sleep_long,
+        db_path=str(tmp_path / "db"),
+        mode="multiprocessing",
+        workers=1,
+        worker_timeout=0.01,
+        show_progress=False,
+    )
+
+    with pit:
+        with pytest.raises(TimeoutError, match="worker pool was terminated"):
+            list(pit)
+
+    assert pit._pool_terminated is True
 
 
 def test_key_func_must_return_string(tmp_path):
