@@ -5,6 +5,7 @@ Extended to include a Rich progress bar with ETA, only displayed if running in a
 """
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -25,6 +26,49 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 R = TypeVar("R")
 K = TypeVar("K", bound=Hashable)
+C = TypeVar("C")
+
+_ENV_PREFIX = "TRAPIT_"
+_UNSET = object()
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("expected true/false, yes/no, on/off, or 1/0")
+
+
+def _parse_optional_float(value: str) -> Optional[float]:
+    if value.strip().lower() in {"none", "null"}:
+        return None
+    return float(value)
+
+
+def _parse_optional_bool(value: str) -> Optional[bool]:
+    if value.strip().lower() in {"none", "null", "auto"}:
+        return None
+    return _parse_bool(value)
+
+
+def _config_value(
+    name: str, supplied: object, default: C, parser: Callable[[str], C]
+) -> C:
+    """Resolve an explicit value, then a TRAPIT_ environment value, then default."""
+    if supplied is not _UNSET:
+        return supplied  # type: ignore[return-value]
+
+    env_name = f"{_ENV_PREFIX}{name.upper()}"
+    value = os.environ.get(env_name)
+    if value is None:
+        return default
+    try:
+        return parser(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid value for {env_name}: {value!r} ({exc})") from exc
+
 
 # Type alias for repro parameter: can be a string mode or a callable
 ReproType = Union[str, Callable[[T], bool]]
@@ -486,23 +530,57 @@ class TrackedParallelIterator:
         iterable: Iterable[T],
         func: Callable[[T], R],
         key_func: Callable[[T], str] | None = None,
-        db_path: str = ".trapit",
-        mode: str = "multiprocessing",
-        workers: Optional[int] = None,
-        chunksize: int = 1,
-        map_size: int = 1024 * 1024 * 1024,
-        map_resize_threshold: float = 0.8,
-        map_resize_factor: float = 2.0,
-        preserve_order: bool = False,
-        worker_timeout: Optional[float] = 300,
-        repro: ReproType = "none",
+        db_path: str | object = _UNSET,
+        mode: str | object = _UNSET,
+        workers: Optional[int] | object = _UNSET,
+        chunksize: int | object = _UNSET,
+        map_size: int | object = _UNSET,
+        map_resize_threshold: float | object = _UNSET,
+        map_resize_factor: float | object = _UNSET,
+        preserve_order: bool | object = _UNSET,
+        worker_timeout: Optional[float] | object = _UNSET,
+        repro: ReproType | object = _UNSET,
         func_args: tuple | None = None,
         func_kwargs: dict | None = None,
-        show_progress: Optional[bool] = None,
-        batch_writes: bool = True,
-        write_batch_size: int = 1000,
-        write_flush_interval: float = 0.5,
+        show_progress: Optional[bool] | object = _UNSET,
+        batch_writes: bool | object = _UNSET,
+        write_batch_size: int | object = _UNSET,
+        write_flush_interval: float | object = _UNSET,
     ):
+        # Explicit constructor arguments take precedence over environment values.
+        db_path = _config_value("db_path", db_path, ".trapit", str)
+        mode = _config_value("mode", mode, "multiprocessing", str)
+        workers = _config_value("workers", workers, None, int)
+        chunksize = _config_value("chunksize", chunksize, 1, int)
+        map_size = _config_value("map_size", map_size, 1024 * 1024 * 1024, int)
+        map_resize_threshold = _config_value(
+            "map_resize_threshold", map_resize_threshold, 0.8, float
+        )
+        map_resize_factor = _config_value(
+            "map_resize_factor", map_resize_factor, 2.0, float
+        )
+        preserve_order = _config_value(
+            "preserve_order", preserve_order, False, _parse_bool
+        )
+        default_worker_timeout: Optional[float] = 300.0
+        worker_timeout = _config_value(
+            "worker_timeout",
+            worker_timeout,
+            default_worker_timeout,
+            _parse_optional_float,
+        )
+        repro = _config_value("repro", repro, "none", str)
+        show_progress = _config_value(
+            "show_progress", show_progress, None, _parse_optional_bool
+        )
+        batch_writes = _config_value("batch_writes", batch_writes, True, _parse_bool)
+        write_batch_size = _config_value(
+            "write_batch_size", write_batch_size, 1000, int
+        )
+        write_flush_interval = _config_value(
+            "write_flush_interval", write_flush_interval, 0.5, float
+        )
+
         if workers is None:
             workers = max(1, cpu_count() - 1)
 

@@ -90,6 +90,59 @@ def test_constructor_validation(tmp_path, kwargs, message):
         TrackedParallelIterator([1], double, show_progress=False, **kwargs)
 
 
+def test_configuration_can_be_read_from_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRAPIT_DB_PATH", str(tmp_path / "env-db"))
+    monkeypatch.setenv("TRAPIT_MODE", "singlethreaded")
+    monkeypatch.setenv("TRAPIT_WORKERS", "3")
+    monkeypatch.setenv("TRAPIT_CHUNKSIZE", "2")
+    monkeypatch.setenv("TRAPIT_MAP_SIZE", "1048576")
+    monkeypatch.setenv("TRAPIT_MAP_RESIZE_THRESHOLD", "0.7")
+    monkeypatch.setenv("TRAPIT_MAP_RESIZE_FACTOR", "3")
+    monkeypatch.setenv("TRAPIT_PRESERVE_ORDER", "yes")
+    monkeypatch.setenv("TRAPIT_WORKER_TIMEOUT", "none")
+    monkeypatch.setenv("TRAPIT_REPRO", "all")
+    monkeypatch.setenv("TRAPIT_SHOW_PROGRESS", "false")
+    monkeypatch.setenv("TRAPIT_BATCH_WRITES", "off")
+    monkeypatch.setenv("TRAPIT_WRITE_BATCH_SIZE", "25")
+    monkeypatch.setenv("TRAPIT_WRITE_FLUSH_INTERVAL", "1.25")
+
+    pit = TrackedParallelIterator([], double)
+
+    assert pit.db_path == str(tmp_path / "env-db")
+    assert pit.mode == "singlethreaded"
+    assert pit.workers == 3
+    assert pit.chunksize == 2
+    assert pit.map_size == 1048576
+    assert pit.map_resize_threshold == 0.7
+    assert pit.map_resize_factor == 3.0
+    assert pit.preserve_order is True
+    assert pit.worker_timeout is None
+    assert pit.repro == "all"
+    assert pit._show_progress is False
+    assert pit.batch_writes is False
+    assert pit.write_batch_size == 25
+    assert pit.write_flush_interval == 1.25
+
+
+def test_explicit_configuration_overrides_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRAPIT_DB_PATH", str(tmp_path / "env-db"))
+    monkeypatch.setenv("TRAPIT_WORKERS", "8")
+
+    pit = TrackedParallelIterator(
+        [], double, db_path=str(tmp_path / "explicit-db"), workers=2
+    )
+
+    assert pit.db_path == str(tmp_path / "explicit-db")
+    assert pit.workers == 2
+
+
+def test_invalid_environment_configuration_has_clear_error(monkeypatch):
+    monkeypatch.setenv("TRAPIT_BATCH_WRITES", "sometimes")
+
+    with pytest.raises(ValueError, match="TRAPIT_BATCH_WRITES"):
+        TrackedParallelIterator([], double)
+
+
 def test_func_args_are_normalized(tmp_path):
     assert TrackedParallelIterator([], double, func_args=None).func_args == ()
     assert TrackedParallelIterator([], double, func_args=3).func_args == (3,)

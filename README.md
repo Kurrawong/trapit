@@ -103,6 +103,26 @@ TrackedParallelIterator(
 )
 ```
 
+### Environment configuration
+
+Optional configuration can also be set with `TRAPIT_`-prefixed environment
+variables. Names are the uppercase parameter names, for example:
+
+```bash
+TRAPIT_DB_PATH=.trapit TRAPIT_MODE=multithreading TRAPIT_WORKERS=4 python app.py
+```
+
+Supported variables are `TRAPIT_DB_PATH`, `TRAPIT_MODE`, `TRAPIT_WORKERS`,
+`TRAPIT_CHUNKSIZE`, `TRAPIT_MAP_SIZE`, `TRAPIT_MAP_RESIZE_THRESHOLD`,
+`TRAPIT_MAP_RESIZE_FACTOR`, `TRAPIT_PRESERVE_ORDER`, `TRAPIT_WORKER_TIMEOUT`,
+`TRAPIT_REPRO`, `TRAPIT_SHOW_PROGRESS`, `TRAPIT_BATCH_WRITES`,
+`TRAPIT_WRITE_BATCH_SIZE`, and `TRAPIT_WRITE_FLUSH_INTERVAL`.
+
+Boolean values accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
+Use `none` for `TRAPIT_WORKER_TIMEOUT` to disable the timeout and `auto` for
+`TRAPIT_SHOW_PROGRESS` to retain TTY detection. Explicit constructor arguments
+take precedence over environment variables.
+
 ### Important parameters
 
 | Parameter        | Default                   | Description                                                                           |
